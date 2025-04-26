@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.~
+*.egg-info/
+.env
+venv/
+.venv/
+
+# Generated Files
+cache_data/
+temp_files/
+*.mp4
+*.wav
+*.png
+*.jpg
+*.jpeg
+*.json # If you don't want to commit the state file
+
+# Superprompt Output
+project_superprompt_output.md
+
+# OS specific
+.DS_Store
+Thumbs.db

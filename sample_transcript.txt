@@ -1,0 +1,5 @@
+Hello and welcome to the first test of the Storyshot system.
+This script will take this text, break it into sentences!
+Then, it should generate audio for each sentence using a text-to-speech API.
+Caching should prevent re-generating audio on subsequent runs, right?
+Let's see if it works. This is the final sentence.

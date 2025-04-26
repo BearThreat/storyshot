@@ -1,0 +1,17 @@
+python-dotenv
+openai
+pydub
+fal-client
+asyncio
+aiohttp
+requests # Good for generic HTTP calls if fal library isn't used directly
+watchdog # For sprompt.py file monitoring
+ffmpeg-python # Optional wrapper if needed, or just call ffmpeg CLI
+nltk # Optional: For better sentence tokenization
+httpx
+openai
+tiktoken
+Pillow
+
+# pip install -r requirements.txt
+# python -m nltk.downloader punkt
