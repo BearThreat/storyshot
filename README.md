@@ -1,3 +1,4 @@
+```markdown
 # StoryShot ✨ - AI Transcript-to-Short-Movie Generator
 
 StoryShot is a command-line application designed to automate the creation of short video sequences from text transcripts. It leverages a suite of cutting-edge AI models for text-to-speech, text-to-image, and image-to-video generation, aiming to produce a visual storyboard-like movie synced with the transcript's audio.
@@ -67,6 +68,7 @@ The main script (`storyshot_.py`) orchestrates the following steps:
 
 ## Project Structure
 
+```
 .
 ├── storyshot_.py             # Main orchestrator script
 ├── text2speech_.py           # Handles Text-to-Speech via Fal.ai
@@ -89,9 +91,7 @@ The main script (`storyshot_.py`) orchestrates the following steps:
 ├── requirements.txt          # Python dependencies
 ├── .env                      # (Required, not committed) API keys and config
 └── .gitignore                # Git ignore file
-
-code
-
+```
 
 ## Setup and Installation
 
@@ -112,10 +112,11 @@ code
 ```bash
 git clone <repository_url> # Replace <repository_url> with the actual URL
 cd storyshot
-3. Create a Virtual Environment (Recommended):
+```
 
-bash
+**3. Create a Virtual Environment (Recommended):**
 
+```bash
 python -m venv .venv
 # Activate the environment:
 # On Windows (cmd.exe):
@@ -124,121 +125,103 @@ python -m venv .venv
 #   .\.venv\Scripts\Activate.ps1
 # On macOS/Linux:
 #   source .venv/bin/activate
-4. Install Dependencies:
+```
 
-bash
+**4. Install Dependencies:**
 
+```bash
 pip install -r requirements.txt
-5. Configure API Keys (.env file):
+```
 
+**5. Configure API Keys (.env file):**
 
-Create a file named .env in the root directory of the project.
+*   Create a file named `.env` in the root directory of the project.
+*   **Do not commit this file to Git.** Add `.env` to your `.gitignore` file if it's not already there.
+*   Add your API keys and any desired model overrides to the `.env` file. Use the following format:
 
+    ```env
+    # Required API Keys
+    OPENAI_KEY="sk-..."
+    FAL_KEY="key_id:key_secret" # Note format: key_id:key_secret
+    OPENROUTER_KEY="sk-or-..."
 
-Do not commit this file to Git. Add .env to your .gitignore file if it's not already there.
+    # Optional Model Overrides (Defaults are shown)
+    # FALAI_TTS_MODEL="fal-ai/playai/tts/v3"
+    # FALAI_TTS_VOICE="Jennifer (English (US)/American)" # Ensure voice is valid for the model
+    # OPENAI_IMAGE_MODEL="gpt-image-1"
+    # FALAI_VIDEO_MODEL="fal-ai/kling-video/v1.6/standard/image-to-video" # Or "fal-ai/wan-i2v"
+    ```
 
+## Usage
 
-Add your API keys and any desired model overrides to the .env file. Use the following format:
-
-env
-
-# Required API Keys
-OPENAI_KEY="sk-..."
-FAL_KEY="key_id:key_secret" # Note format: key_id:key_secret
-OPENROUTER_KEY="sk-or-..."
-
-# Optional Model Overrides (Defaults are shown)
-# FALAI_TTS_MODEL="fal-ai/playai/tts/v3"
-# FALAI_TTS_VOICE="Jennifer (English (US)/American)" # Ensure voice is valid for the model
-# OPENAI_IMAGE_MODEL="gpt-image-1"
-# FALAI_VIDEO_MODEL="fal-ai/kling-video/v1.6/standard/image-to-video" # Or "fal-ai/wan-i2v"
-
-Usage
 Run the main orchestrator script from your terminal, providing the path to your transcript file:
 
-bash
-
+```bash
 python storyshot_.py path/to/your_transcript.txt [options]
-Arguments:
+```
 
+**Arguments:**
 
-transcript_file (Required): Path to the input transcript text file.
+*   `transcript_file` (Required): Path to the input transcript text file.
+*   `-f`, `--force-regenerate` (Optional): Ignores the cache and re-runs all generation steps for all sentences.
+*   `--skip-images` (Optional): Skips the prompt-to-image generation stage (and consequently, video generation and assembly).
+*   `--skip-videos` (Optional): Skips the image-to-video generation stage (and consequently, assembly).
+*   `--skip-assembly` (Optional): Skips the final FFmpeg video/audio assembly stage.
 
--f, --force-regenerate (Optional): Ignores the cache and re-runs all generation steps for all sentences.
+**Example:**
 
---skip-images (Optional): Skips the prompt-to-image generation stage (and consequently, video generation and assembly).
-
---skip-videos (Optional): Skips the image-to-video generation stage (and consequently, assembly).
-
---skip-assembly (Optional): Skips the final FFmpeg video/audio assembly stage.
-
-Example:
-
-bash
-
+```bash
 python storyshot_.py sample_transcript.txt --force-regenerate
-Output:
+```
 
+**Output:**
 
-Generated media files will be stored in the temp_files/ subdirectories.
+*   Generated media files will be stored in the `temp_files/` subdirectories.
+*   Cache metadata will be stored in `cache_data/cache.json`.
+*   The final assembled video (if assembly is not skipped) will be saved as `storyshot_output.mp4` in the project's root directory.
+*   Detailed logs, including cost and timing summaries, will be printed to the console.
 
-Cache metadata will be stored in cache_data/cache.json.
+## Development & Testing
 
-The final assembled video (if assembly is not skipped) will be saved as storyshot_output.mp4 in the project's root directory.
+*   **Modular Testing:** Each `_*.py` script is designed with an `if __name__ == "__main__":` block containing test logic for that specific module. You can run these tests individually:
+    ```bash
+    python text2speech_.py
+    python sentence2storyboard_.py
+    # etc.
+    ```
+*   **Superprompt Concatenation:** The `sprompt.py` script runs a `watchdog` server. When changes are detected in any `.py` or `.md` file specified, it concatenates their contents into `project_superprompt_output.md`. This is useful for providing updated context to an LLM during development. Run it via `python sprompt.py`.
 
-Detailed logs, including cost and timing summaries, will be printed to the console.
+## Caching
 
-Development & Testing
+*   **Purpose:** To save time and API costs on subsequent runs.
+*   **Metadata:** `cache_data/cache.json` stores a dictionary where keys are normalized sentences. Each entry holds the results (paths, durations, costs, etc.) for TTS, storyboard prompts, image generation (nested list), and video generation (nested within image outputs).
+*   **Assets:** Large media files (audio, images, videos) are stored in the `temp_files/` directory. The cache file links to these assets.
+*   **Persistence:** Both the cache file and the temp files are persistent. To clear the cache, delete `cache_data/cache.json` and the contents of `temp_files/`.
 
-Modular Testing: Each _*.py script is designed with an if __name__ == "__main__": block containing test logic for that specific module. You can run these tests individually:
-bash
+## Cost and Performance
 
-python text2speech_.py
-python sentence2storyboard_.py
-# etc.
+*   **API Costs:** Be aware that generating images (especially with `gpt-image-1`) and videos (with models like Kling) can be **expensive**. Monitor the cost summaries printed at the end of each run.
+*   **Execution Time:** Generation steps, particularly image and video, can take a significant amount of time (minutes per item). Caching is crucial for iterative development.
+*   **Rate Limits:** APIs have rate limits (e.g., `gpt-image-1` is ~5 images/minute). The `prompt2image_openai_.py` module includes basic handling and the orchestrator runs tasks concurrently, but very large transcripts might hit limits.
 
-Superprompt Concatenation: The sprompt.py script runs a watchdog server. When changes are detected in any .py or .md file specified, it concatenates their contents into project_superprompt_output.md. This is useful for providing updated context to an LLM during development. Run it via python sprompt.py.
+## Future Work / Roadmap
 
-Caching
+*   **Visual Cohesion:** Improve prompt engineering in `sentence2storyboard_.py` to generate sequences that maintain better visual consistency across shots within a sentence, and potentially across sentences. This might involve passing previous prompts or even image feedback to the LLM.
+*   **More Model Options:** Easily configure and switch between different LLM, image, video, and TTS models.
+*   **Advanced FFmpeg:** More sophisticated editing, transitions, or effects during assembly.
+*   **Error Recovery:** More granular error handling and potential recovery/retry logic within the orchestrator.
+*   **User Interface:** Develop a web or desktop UI instead of being purely command-line based.
+*   **Voice Cloning (TTS):** Integrate TTS models that support voice cloning.
 
-Purpose: To save time and API costs on subsequent runs.
+## Contributing
 
-Metadata: cache_data/cache.json stores a dictionary where keys are normalized sentences. Each entry holds the results (paths, durations, costs, etc.) for TTS, storyboard prompts, image generation (nested list), and video generation (nested within image outputs).
-
-Assets: Large media files (audio, images, videos) are stored in the temp_files/ directory. The cache file links to these assets.
-
-Persistence: Both the cache file and the temp files are persistent. To clear the cache, delete cache_data/cache.json and the contents of temp_files/.
-
-Cost and Performance
-
-API Costs: Be aware that generating images (especially with gpt-image-1) and videos (with models like Kling) can be expensive. Monitor the cost summaries printed at the end of each run.
-
-Execution Time: Generation steps, particularly image and video, can take a significant amount of time (minutes per item). Caching is crucial for iterative development.
-
-Rate Limits: APIs have rate limits (e.g., gpt-image-1 is ~5 images/minute). The prompt2image_openai_.py module includes basic handling and the orchestrator runs tasks concurrently, but very large transcripts might hit limits.
-
-Future Work / Roadmap
-
-Visual Cohesion: Improve prompt engineering in sentence2storyboard_.py to generate sequences that maintain better visual consistency across shots within a sentence, and potentially across sentences. This might involve passing previous prompts or even image feedback to the LLM.
-
-More Model Options: Easily configure and switch between different LLM, image, video, and TTS models.
-
-Advanced FFmpeg: More sophisticated editing, transitions, or effects during assembly.
-
-Error Recovery: More granular error handling and potential recovery/retry logic within the orchestrator.
-
-User Interface: Develop a web or desktop UI instead of being purely command-line based.
-
-Voice Cloning (TTS): Integrate TTS models that support voice cloning.
-
-Contributing
 Contributions are welcome! Please feel free to open an issue to discuss bugs or feature requests, or submit a pull request.
 
-License
+## License
+
 (Specify your license here, e.g., MIT License)
 
-code
-
+```
 MIT License
 
 Copyright (c) [Year] [Your Name/Organization]
@@ -260,3 +243,4 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```
