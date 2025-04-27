@@ -1,5 +1,1 @@
-Hello and welcome to the first test of the Storyshot system.
-This script will take this text, break it into sentences!
-Then, it should generate audio for each sentence using a text-to-speech API.
-Caching should prevent re-generating audio on subsequent runs, right?
-Let's see if it works. This is the final sentence.
+I just despise her, she is part of the problem. LP money was funneled to her husband's "consulting" firm after winning the chair nomination over the past few years. She hasn't taken things seriously, by wearing a clown nose in her show right after the presidential nomination happened. She led the push to get out the treasurer and secretary, Todd Hagopian and Caryn Ann Harlos who were principled and would actually speak out when the board would try shady shit. She also allowed the Colorado affiliate to endorse RFK Jr for president instead of the LP ticket, let a few different state parties dissolve, overseen a massive drop off in membership and fundraising. She came in with the Mises Caucus wave having all of these "plans", but didn't even remotely come close to accomplishing anything positive in any facet. Her idea of a "plan" is very similar to the "plan" that AE leadership has had for the past year. which is no plan

@@ -12,6 +12,17 @@ venv/
 # Generated Files
 cache_data/
 temp_files/
+# Explicitly ignore subdirs within temp_files (good practice)
+temp_files/audio/
+temp_files/images/
+temp_files/videos/
+temp_files/ffmpeg_concat_lists/
+temp_files/final_clips/
+temp_files/intermediate_videos/
+
+# Potential Log files
+*.log
+
 *.mp4
 *.wav
 *.png
@@ -19,9 +30,12 @@ temp_files/
 *.jpeg
 *.json # If you don't want to commit the state file
 
-# Superprompt Output
+# Superprompt Output (duplicate of the prompt + files)
 project_superprompt_output.md
 
 # OS specific
-.DS_Store
+.vscode/
+.idea/
+*.DS_Store
 Thumbs.db
+
