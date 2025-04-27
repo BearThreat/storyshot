@@ -68,15 +68,8 @@ The main script (`storyshot_.py`) orchestrates the following steps:
 
 ## Project Structure
 
-```
+
 .
-├── storyshot_.py             # Main orchestrator script
-├── text2speech_.py           # Handles Text-to-Speech via Fal.ai
-├── openrouter_engine_.py     # Client for interacting with OpenRouter LLMs
-├── sentence2storyboard_.py   # Generates image prompts using an LLM
-├── prompt2image_openai_.py   # Generates images via OpenAI
-├── image2video_.py           # Generates video clips via Fal.ai
-├── ffmpeg_assembler_.py      # Assembles video clips and audio using FFmpeg
 ├── cache_data/               # Directory for storing cache metadata
 │   └── cache.json            # (Generated) Cache metadata file
 ├── temp_files/               # Directory for storing generated media files (persistent cache)
@@ -85,13 +78,20 @@ The main script (`storyshot_.py`) orchestrates the following steps:
 │   ├── videos/               # Generated video files
 │   ├── ffmpeg_concat_lists/  # Temporary lists for FFmpeg concatenation
 │   └── final_clips/          # Intermediate assembled clips per sentence
+├── storyshot_.py             # Main orchestrator script
+├── text2speech_.py           # Handles Text-to-Speech via Fal.ai
+├── openrouter_engine_.py     # Client for interacting with OpenRouter LLMs
+├── sentence2storyboard_.py   # Generates image prompts using an LLM
+├── prompt2image_openai_.py   # Generates images via OpenAI
+├── image2video_.py           # Generates video clips via Fal.ai
+├── ffmpeg_assembler_.py      # Assembles video clips and audio using FFmpeg
 ├── sprompt.py                # Dev utility server to concatenate files for LLM input
 ├── project_superprompt.md    # The high-level design document/prompt
 ├── README.md                 # This file
 ├── requirements.txt          # Python dependencies
-├── .env                      # (Required, not committed) API keys and config
+├── .env                      # (Required, not committed) API keys and config (see below)
 └── .gitignore                # Git ignore file
-```
+
 
 ## Setup and Installation
 
@@ -110,7 +110,7 @@ The main script (`storyshot_.py`) orchestrates the following steps:
 **2. Clone the Repository:**
 
 ```bash
-git clone <repository_url> # Replace <repository_url> with the actual URL
+git clone https://github.com/BearThreat/storyshot.git
 cd storyshot
 ```
 
@@ -218,8 +218,6 @@ python storyshot_.py sample_transcript.txt --force-regenerate
 Contributions are welcome! Please feel free to open an issue to discuss bugs or feature requests, or submit a pull request.
 
 ## License
-
-(Specify your license here, e.g., MIT License)
 
 ```
 MIT License
