@@ -1,20 +1,26 @@
 # File: ffmpeg_assembler_.py
 """
-FFmpeg Assembly Module (ffmpeg_assembler_.py) - V4 (Enhanced Checks, Keep Clips on Fail)
+FFmpeg Assembly Module (ffmpeg_assembler_.py) - V5 (Robust Input Checks)
 
 Handles the assembly of individual video clips and audio segments into a final
 movie file using FFmpeg. It is orchestrated by storyshot_.py.
 
-Responsibilities: same as V3
+Responsibilities:
+- Take paths to successfully generated sentence video clips and audio files.
+- Concatenate video clips for each sentence.
+- Merge the concatenated video with the sentence's audio, trimming to shortest.
+- Concatenate all processed sentence clips into a final movie.
+- Handle potential FFmpeg errors.
+- Perform basic verification on intermediate and final outputs.
 
-V4 Changes:
-- Modified `_check_stream_exists` to request additional stream info (like duration or bitrate)
-  to better detect potentially empty/invalid streams beyond just codec presence.
-- Added explicit `-map 0:a?` to the final concatenation command (re-encode step)
-  to ensure audio mapping is attempted even if optional.
-- Modified `assemble_movie` cleanup logic: If the final movie verification fails,
-  the generated `final_sentence_clip_*.mp4` files are *not* deleted, aiding manual inspection.
-- Added logging for source audio file size and final sentence clip size.
+V5 Changes:
+- Modified `assemble_movie` to perform detailed input eligibility checks *before*
+  creating tasks for `_assemble_sentence_clip`.
+- Ensures assembly is attempted only for sentences with valid TTS audio
+  and at least one valid video clip based on cache data.
+- Skips ineligible sentences gracefully.
+- Uses optional stream mapping (`-map 0:v? -map 0:a?`) in final concat for resilience.
+- Keeps V4 behaviour of retaining intermediate clips on final concat/verification failure.
 
 Requires FFmpeg and FFprobe to be installed and accessible in the system's PATH.
 """
@@ -50,7 +56,7 @@ class FFmpegAssemblyError(Exception):
     pass
 
 class FFmpegAssembler:
-    """Handles video and audio assembly using FFmpeg. (V4)"""
+    """Handles video and audio assembly using FFmpeg. (V5)"""
 
     def __init__(self, final_movie_path: str | Path = "final_movie.mp4"):
         self.final_movie_path = Path(final_movie_path)
@@ -63,11 +69,11 @@ class FFmpegAssembler:
         self.clip_dir.mkdir(parents=True, exist_ok=True)
         self.temp_video_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"FFmpegAssembler V4 initialized. Output: {self.final_movie_path}")
-        logger.info("V4 Changes: Added optional audio map, enhanced stream check, keep sentence clips on final failure.")
+        logger.info(f"FFmpegAssembler V5 initialized. Output: {self.final_movie_path}")
+        logger.info("V5 Changes: Added eligibility checks, optional final map streams.")
 
     async def _run_command_async(self, command: str, command_args: List[str], log_prefix: str) -> Tuple[bool, str, str]:
-        # (This function remains the same as V3)
+        # (This function remains the same as V3/V4)
         full_command_str = f"{command} {' '.join(shlex.quote(str(arg)) for arg in command_args)}"
         logger.debug(f"{log_prefix}: Executing: {full_command_str}")
         start_time = time.monotonic()
@@ -103,20 +109,25 @@ class FFmpegAssembler:
         return await self._run_command_async("ffprobe", command_args, log_prefix)
 
     async def _assemble_sentence_clip(self, sentence_key: str, sentence_cache_entry: Dict[str, Any], sentence_hash: str) -> Optional[Path]:
-        """Assembles the video and audio for a single sentence. (V4)"""
+        """
+        Assembles the video and audio for a single sentence. (V4 Logic - Seems Robust)
+        This is called *after* eligibility checks in assemble_movie (V5).
+        """
         log_prefix = f"AssembleSentence[{sentence_hash}]"
         temp_files_to_clean = []
         final_clip_path_obj = self.clip_dir / f"final_sentence_clip_{sentence_hash}.mp4"
 
         try:
-            # 1. Gather Inputs (logic same, added logging)
+            # 1. Gather Inputs (Should already be validated by caller in V5, but double-check paths)
             tts_output = sentence_cache_entry.get("tts_output")
             sb_prompts = sentence_cache_entry.get("storyboard_prompts")
 
-            if not tts_output or tts_output.get("status") != "success":
-                logger.warning(f"{log_prefix}: Skipping - Missing or failed TTS.")
+            # Basic null checks (more detailed checks happened before task creation in V5)
+            if not tts_output or not sb_prompts:
+                logger.warning(f"{log_prefix}: Skipping - Missing TTS or Storyboard data.")
                 return None
-            audio_path_str = tts_output.get("audio_path", "")
+
+            audio_path_str = tts_output.get("audio_path")
             if not audio_path_str:
                  logger.warning(f"{log_prefix}: Skipping - Audio path missing in TTS output.")
                  return None
@@ -133,8 +144,7 @@ class FFmpegAssembler:
                  except Exception as stat_err:
                       logger.warning(f"{log_prefix}: Could not get size for source audio {audio_path.name}: {stat_err}")
 
-            # (Video path gathering remains the same as V3)
-            if not sb_prompts or sb_prompts.get("status") != "success": logger.warning(f"{log_prefix}: Skipping - Missing/failed Storyboard Prompts."); return None
+            # Gather successful video paths
             image_outputs = sb_prompts.get("image_outputs", [])
             successful_video_paths = []
             if isinstance(image_outputs, list):
@@ -143,9 +153,18 @@ class FFmpegAssembler:
                         vid_out = img_out.get("video_output")
                         if isinstance(vid_out, dict) and vid_out.get("status") == "success":
                              vid_path_str = vid_out.get("video_path")
-                             if vid_path_str and Path(vid_path_str).exists(): successful_video_paths.append(Path(vid_path_str))
-                             else: logger.warning(f"{log_prefix}: Source video #{img_idx+1} missing/not found: {vid_path_str}")
-            if not successful_video_paths: logger.warning(f"{log_prefix}: Skipping assembly - No successful source video clips."); return None
+                             if vid_path_str:
+                                 vid_path = Path(vid_path_str)
+                                 if vid_path.exists():
+                                     successful_video_paths.append(vid_path)
+                                 else:
+                                     logger.warning(f"{log_prefix}: Source video #{img_idx+1} file NOT FOUND: {vid_path_str}")
+                             else:
+                                  logger.warning(f"{log_prefix}: Source video path missing for image #{img_idx+1}")
+
+            if not successful_video_paths:
+                logger.warning(f"{log_prefix}: Skipping assembly - No available/successful source video clips found for sentence.")
+                return None
             logger.info(f"{log_prefix}: Preparing to assemble {len(successful_video_paths)} videos and audio {audio_path.name}.")
 
 
@@ -155,6 +174,7 @@ class FFmpegAssembler:
             try:
                 with open(concat_list_path, "w", encoding="utf-8") as f:
                     for vid_path in successful_video_paths:
+                        # Use resolved absolute paths with forward slashes within single quotes
                         abs_path_str = str(vid_path.resolve()).replace('\\', '/')
                         f.write(f"file '{abs_path_str}'\n")
                 logger.debug(f"{log_prefix}: Created video concat list: {concat_list_path.name}")
@@ -164,23 +184,49 @@ class FFmpegAssembler:
             temp_concat_video_path = self.temp_video_dir / f"intermediate_concat_video_{sentence_hash}.mp4"
             temp_files_to_clean.append(temp_concat_video_path)
             logger.info(f"{log_prefix}: Re-encoding intermediate video ({len(successful_video_paths)} clips) -> {temp_concat_video_path.name}...")
-            concat_cmd = [ "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list_path.resolve()), "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-map", "0:v", "-an", str(temp_concat_video_path.resolve()) ]
+            # Command: concat demuxer, re-encode with fast preset, video only
+            concat_cmd = [
+                "-y",                 # Overwrite output without asking
+                "-f", "concat",       # Use concat demuxer
+                "-safe", "0",         # Allow unsafe file paths (needed for absolute)
+                "-i", str(concat_list_path.resolve()), # Input list file
+                "-c:v", "libx264",    # Re-encode video stream
+                "-preset", "fast",    # Faster encoding preset
+                "-crf", "23",         # Constant Rate Factor (quality, lower is better)
+                "-map", "0:v",        # Map only the video stream from input group 0
+                "-an",                # No audio in this intermediate file
+                str(temp_concat_video_path.resolve()) # Output path
+            ]
             success, _, stderr_concat = await self._run_ffmpeg_async(concat_cmd, f"{log_prefix}-VidConcatReEncode")
             if not success: raise FFmpegAssemblyError(f"Intermediate video concat failed. Stderr: {stderr_concat[-500:]}")
             concat_vid_size = temp_concat_video_path.stat().st_size if temp_concat_video_path.exists() else -1
-            if concat_vid_size < 1000: raise FFmpegAssemblyError(f"Intermediate video {temp_concat_video_path.name} invalid (size: {concat_vid_size} bytes). Encoding likely failed.")
+            if concat_vid_size < 1000: # Basic size check
+                raise FFmpegAssemblyError(f"Intermediate video {temp_concat_video_path.name} invalid (size: {concat_vid_size} bytes). Encoding likely failed.")
             logger.info(f"{log_prefix}: Intermediate video re-encoded ({concat_vid_size} bytes).")
 
             # 4. Combine Intermediate Video and Sentence Audio (remains same)
             logger.info(f"{log_prefix}: Merging video '{temp_concat_video_path.name}' + audio '{audio_path.name}' -> {final_clip_path_obj.name}...")
-            merge_cmd = [ "-y", "-i", str(temp_concat_video_path.resolve()), "-i", str(audio_path.resolve()), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-shortest", str(final_clip_path_obj.resolve()) ]
+            # Command: copy video stream, re-encode audio, trim to shortest input stream duration
+            merge_cmd = [
+                "-y",
+                "-i", str(temp_concat_video_path.resolve()), # Input 0: video
+                "-i", str(audio_path.resolve()),            # Input 1: audio
+                "-map", "0:v:0",        # Map video stream from input 0
+                "-map", "1:a:0",        # Map audio stream from input 1
+                "-c:v", "copy",         # Copy video stream without re-encoding
+                "-c:a", "aac",          # Re-encode audio to AAC (commonly compatible)
+                "-b:a", "128k",         # Audio bitrate
+                "-shortest",            # Finish encoding when the shortest input stream ends
+                str(final_clip_path_obj.resolve()) # Output path
+            ]
             success, _, stderr_merge = await self._run_ffmpeg_async(merge_cmd, f"{log_prefix}-AudVidMerge")
             if not success: raise FFmpegAssemblyError(f"Audio/Video merge command failed. Stderr: {stderr_merge[-500:]}")
             final_clip_size = final_clip_path_obj.stat().st_size if final_clip_path_obj.exists() else -1
-            if final_clip_size < 1500: raise FFmpegAssemblyError(f"Final sentence clip {final_clip_path_obj.name} invalid (size: {final_clip_size} bytes). Merge likely failed.")
+            if final_clip_size < 1500: # Basic size check
+                raise FFmpegAssemblyError(f"Final sentence clip {final_clip_path_obj.name} invalid (size: {final_clip_size} bytes). Merge likely failed.")
             logger.info(f"{log_prefix}: Merge command finished for {final_clip_path_obj.name} ({final_clip_size} bytes).")
 
-            # 5. VERIFY AUDIO (using enhanced check)
+            # 5. VERIFY AUDIO (using enhanced check - remains same V4->V5)
             logger.info(f"{log_prefix}: Verifying audio stream in {final_clip_path_obj.name}...")
             has_audio, audio_details = await self._check_stream_details(final_clip_path_obj, 'audio')
             if not has_audio:
@@ -194,14 +240,14 @@ class FFmpegAssembler:
 
         except FFmpegAssemblyError as e:
             logger.error(f"{log_prefix}: Assembly failed: {e}", exc_info=False)
-            if final_clip_path_obj.exists(): 
-                try: final_clip_path_obj.unlink() 
+            if final_clip_path_obj.exists():
+                try: final_clip_path_obj.unlink()
                 except OSError: pass
             return None
         except Exception as e:
             logger.error(f"{log_prefix}: Assembly failed unexpectedly: {e}", exc_info=True)
-            if final_clip_path_obj.exists(): 
-                try: final_clip_path_obj.unlink() 
+            if final_clip_path_obj.exists():
+                try: final_clip_path_obj.unlink()
                 except OSError: pass
             return None
         finally:
@@ -214,7 +260,7 @@ class FFmpegAssembler:
 
     async def _check_stream_details(self, filepath: Path, stream_type: str = 'audio') -> Tuple[bool, str]:
         """
-        Uses ffprobe to check for a stream type and extracts basic details. (V4)
+        Uses ffprobe to check for a stream type and extracts basic details. (V4 Logic - Seems Robust)
 
         Returns:
             Tuple[bool, str]: (stream_exists: bool, details: str)
@@ -254,7 +300,8 @@ class FFmpegAssembler:
             try: bitrate = int(bitrate_str)
             except ValueError: bitrate = -1
 
-            if codec != "N/A" and (duration > 0 or bitrate > 0):
+            # Check for valid codec AND (valid duration OR valid bitrate)
+            if codec != "N/A" and codec != "unknown" and (duration > 0 or bitrate > 0):
                  stream_found = True
                  details = f"Codec: {codec}, Duration: {duration_str}s, Bitrate: {bitrate_str}bps"
                  logger.debug(f"{log_prefix}: Check PASSED. Details: {details}")
@@ -272,63 +319,127 @@ class FFmpegAssembler:
         return stream_found, details
 
     async def assemble_movie(self, cache_data: Dict[str, Any], ordered_sentence_keys: List[str], get_sentence_hash_func: callable) -> Optional[Path]:
-        """Orchestrates the assembly of the final movie. (V4: Keep clips on fail)"""
+        """
+        Orchestrates the assembly of the final movie. (V5: Robust Input Checks)
+        Always attempts assembly based on available valid data in the cache.
+        Skips sentences missing required audio or video inputs.
+        """
         start_time = time.monotonic()
-        logger.info("--- Starting Final Movie Assembly V4 ---")
+        logger.info("--- Starting Final Movie Assembly V5 (Robust Checks) ---")
 
-        generated_sentence_clips = [] # Keep track of successfully generated clips
-        files_to_cleanup_finally = [] # Files to clean ONLY if final verification passes
-
-        # --- Step 1: Assemble each sentence clip (Concurrent - logic same as V3) ---
-        logger.info(f"Assembling individual sentence clips for {len(ordered_sentence_keys)} sentences concurrently...")
         assembly_tasks = []
         task_to_key_map = {}
+        eligible_keys_for_assembly = [] # Track keys that *could* be assembled
+
+        # --- Step 1a: Filter Sentences and Prepare Assembly Tasks ---
+        logger.info("Checking sentence eligibility and preparing assembly tasks...")
+        skipped_sentences = 0
         for key in ordered_sentence_keys:
-            if key in cache_data:
-                sentence_hash = get_sentence_hash_func(key)
+            sentence_hash = get_sentence_hash_func(key) # Get hash for logging prefix
+
+            # --- Detailed Input Eligibility Check ---
+            cache_entry = cache_data.get(key)
+            is_eligible = False
+            skip_reason = "Unknown"
+
+            if not cache_entry:
+                skip_reason = "Cache entry missing"
+            else:
+                # Check TTS
+                tts_output = cache_entry.get("tts_output")
+                if not tts_output or tts_output.get("status") != "success":
+                    skip_reason = "TTS failed or missing"
+                elif not tts_output.get("audio_path") or not Path(tts_output["audio_path"]).exists():
+                    skip_reason = f"TTS audio file missing/not found ({tts_output.get('audio_path')})"
+                else:
+                    # Check Storyboard and Videos (need at least one valid video)
+                    sb_prompts = cache_entry.get("storyboard_prompts")
+                    if not sb_prompts or sb_prompts.get("status") != "success":
+                        skip_reason = "Storyboard prompts failed or missing"
+                    else:
+                        image_outputs = sb_prompts.get("image_outputs", [])
+                        has_any_valid_video = False
+                        if isinstance(image_outputs, list):
+                            for img_idx, img_out in enumerate(image_outputs):
+                                if isinstance(img_out, dict) and img_out.get("status") == "success":
+                                    vid_out = img_out.get("video_output")
+                                    if isinstance(vid_out, dict) and vid_out.get("status") == "success":
+                                        vid_path_str = vid_out.get("video_path")
+                                        if vid_path_str and Path(vid_path_str).exists():
+                                            has_any_valid_video = True
+                                            break # Found one valid video, that's enough
+                        if not has_any_valid_video:
+                            skip_reason = "No successfully generated video clips found"
+                        else:
+                            is_eligible = True # All checks passed
+
+            if is_eligible:
+                logger.debug(f"AssembleMovie: Sentence '{key[:30]}...' is ELIGIBLE for assembly.")
+                eligible_keys_for_assembly.append(key)
                 task_name=f"Assemble_{sentence_hash}_{key[:10]}"
-                task = asyncio.create_task( self._assemble_sentence_clip(key, cache_data[key], sentence_hash), name=task_name )
+                # Create task for eligible sentence
+                task = asyncio.create_task( self._assemble_sentence_clip(key, cache_entry, sentence_hash), name=task_name )
                 assembly_tasks.append(task)
                 task_to_key_map[task_name] = key
-            else: logger.warning(f"AssembleMovie: Key '{key}' not found in cache data.")
-        if not assembly_tasks: logger.error("No sentences found to assemble clips."); return None
+            else:
+                skipped_sentences += 1
+                logger.warning(f"AssembleMovie: Skipping sentence '{key[:30]}...' for assembly. Reason: {skip_reason}.")
 
+        logger.info(f"Eligibility check complete: {len(eligible_keys_for_assembly)} eligible, {skipped_sentences} skipped.")
+
+        if not assembly_tasks:
+             logger.error("No eligible sentences found to assemble clips. Cannot create final movie.")
+             # No cleanup needed as no tasks ran
+             return None
+
+        # --- Step 1b: Run Assembly Tasks Concurrently for Eligible Sentences ---
+        logger.info(f"Executing assembly for {len(assembly_tasks)} eligible sentences concurrently...")
         results = await asyncio.gather(*assembly_tasks, return_exceptions=True)
         logger.info("Finished waiting for sentence clip assembly tasks.")
 
-        # --- Collect results IN ORDER (logic same as V3) ---
+        # --- Step 1c: Collect results IN ORDER based on original eligible keys ---
         key_to_result_map = {}
         successful_clip_count, failed_clip_count = 0, 0
+        generated_sentence_clips = [] # Keep track for potential cleanup/debug
         for i, result in enumerate(results):
-             task_name = assembly_tasks[i].get_name()
-             if task_name not in task_to_key_map: logger.error(f"INTERNAL ERROR: Task '{task_name}' not in map!"); failed_clip_count += 1; continue
-             original_key = task_to_key_map[task_name]
-             if isinstance(result, Exception):
-                  logger.error(f"AssembleMovie: Task {task_name} ('{original_key[:30]}...') failed: {result}", exc_info=False)
-                  key_to_result_map[original_key] = None; failed_clip_count += 1
-             elif result is None:
-                  logger.warning(f"AssembleMovie: Task {task_name} ('{original_key[:30]}...') returned None.")
-                  key_to_result_map[original_key] = None; failed_clip_count += 1
-             else:
-                  logger.debug(f"AssembleMovie: Task {task_name} ('{original_key[:30]}...') succeeded: {result.name}")
-                  key_to_result_map[original_key] = result; successful_clip_count += 1
-                  generated_sentence_clips.append(result) # Add to list of generated clips potentially kept
-        logger.info(f"Sentence clip results: {successful_clip_count} success, {failed_clip_count} failed/skipped.")
+            task_name = assembly_tasks[i].get_name()
+            original_key = task_to_key_map.get(task_name)
+            if not original_key:
+                logger.error(f"INTERNAL ERROR: Task '{task_name}' not in map during result processing!");
+                failed_clip_count += 1; continue
 
-        # --- Populate final_clip_paths_in_order with VERIFIED clips (using enhanced check) ---
+            if isinstance(result, Exception):
+                logger.error(f"AssembleMovie: Task {task_name} ('{original_key[:30]}...') FAILED during execution: {result}", exc_info=False)
+                key_to_result_map[original_key] = None; failed_clip_count += 1
+            elif result is None:
+                logger.warning(f"AssembleMovie: Task {task_name} ('{original_key[:30]}...') returned None (likely internal assembly failure).")
+                key_to_result_map[original_key] = None; failed_clip_count += 1
+            elif isinstance(result, Path) and result.exists():
+                 logger.debug(f"AssembleMovie: Task {task_name} ('{original_key[:30]}...') succeeded: {result.name}")
+                 key_to_result_map[original_key] = result; successful_clip_count += 1
+                 generated_sentence_clips.append(result) # Track successful clips
+            else:
+                 logger.error(f"AssembleMovie: Task {task_name} ('{original_key[:30]}...') returned unexpected result: {result}")
+                 key_to_result_map[original_key] = None; failed_clip_count += 1
+
+        logger.info(f"Assembly task results: {successful_clip_count} success, {failed_clip_count} failed/skipped.")
+
+        # --- Step 1d: Populate final_clip_paths_in_order with VERIFIED clips ---
         final_clip_paths_in_order: List[Path] = []
         verified_clips_for_cleanup = [] # Only list clips that pass verification
         logger.info("Performing secondary verification on generated sentence clips...")
         verification_tasks = []
         path_to_key_map = {}
-        for clip_path in generated_sentence_clips:
-             if clip_path and clip_path.exists():
-                 task = asyncio.create_task(self._check_stream_details(clip_path, 'audio'), name=f"Verify_{clip_path.name}")
-                 verification_tasks.append(task)
-                 path_to_key_map[task] = clip_path # Map task back to path
+        for clip_path in generated_sentence_clips: # Iterate over successfully generated GENERATED clips
+            if clip_path and clip_path.exists():
+                task = asyncio.create_task(self._check_stream_details(clip_path, 'audio'), name=f"Verify_{clip_path.name}")
+                verification_tasks.append(task)
+                path_to_key_map[task] = clip_path
+
         verification_results = await asyncio.gather(*verification_tasks, return_exceptions=True)
 
         verified_paths_map = {} # Map path -> (bool, details)
+        # Process verification_results (same as V4)
         for i, verify_result in enumerate(verification_results):
             task = verification_tasks[i]
             clip_path = path_to_key_map[task]
@@ -341,75 +452,72 @@ class FFmpegAssembler:
                  logger.error(f"Unexpected verification result type for {clip_path.name}: {type(verify_result)}")
                  verified_paths_map[clip_path] = (False, "Unexpected result type")
 
-        # Now populate the ordered list based on verification map
-        for key in ordered_sentence_keys:
-             final_clip_path = key_to_result_map.get(key)
+        # Now populate the ordered list based on the *original sentence order* and verification map
+        for key in ordered_sentence_keys: # Use the master list order
+             final_clip_path = key_to_result_map.get(key) # Get the generated path for this key, if any
              if final_clip_path and final_clip_path.exists():
                   is_verified, details = verified_paths_map.get(final_clip_path, (False, "Verification not run?"))
                   if is_verified:
-                      logger.debug(f"Adding verified clip {final_clip_path.name} ('{key[:30]}...') to final list.")
+                      logger.debug(f"Adding verified clip {final_clip_path.name} ('{key[:30]}...') to final movie list.")
                       final_clip_paths_in_order.append(final_clip_path)
-                      verified_clips_for_cleanup.append(final_clip_path) # Mark for eventual cleanup
+                      verified_clips_for_cleanup.append(final_clip_path) # Mark for eventual cleanup IF FINAL MOVIE SUCCEEDS
                   else:
-                      logger.error(f"AssembleMovie: EXCLUSION! Verified clip {final_clip_path.name} ('{key[:30]}...') FAILED secondary verification ({details}).")
-             else: logger.warning(f"AssembleMovie: EXCLUSION! Clip for '{key[:30]}...' failed generation or missing.")
+                      logger.error(f"AssembleMovie: EXCLUSION! Generated clip {final_clip_path.name} ('{key[:30]}...') FAILED secondary verification ({details}).")
+             # No need for else, we only care about successfully generated and verified clips
 
-        logger.info(f"Proceeding with {len(final_clip_paths_in_order)} sentence clips for final movie.")
+        logger.info(f"Proceeding with {len(final_clip_paths_in_order)} successfully generated and verified sentence clips for final movie.")
 
         if not final_clip_paths_in_order:
-            logger.error("No sentence clips passed secondary verification. Cannot create final movie.")
+            logger.error("No sentence clips were successfully generated or passed verification. Cannot create final movie.")
             self._cleanup_temp_files([], "no verified clips") # Cleanup lists/temps if any
-            # Note: generated_sentence_clips are kept because final step failed
+            # Note: generated_sentence_clips might still exist in FINAL_CLIPS_SUBDIR if verification failed, which is intended V4 behaviour
             return None
 
         # --- Step 2: Create Final Concatenation List ---
         final_concat_list_path = self.list_dir / "final_movie_list.txt"
-        files_to_cleanup_finally.append(final_concat_list_path)
+        files_to_cleanup_finally = [final_concat_list_path] # Always cleanup this list if we get here
         try:
-            with open(final_concat_list_path, "w", encoding="utf-8") as f:
-                logger.debug(f"Writing final concat list ({final_concat_list_path.name}) with {len(final_clip_paths_in_order)} entries.")
-                for clip_path in final_clip_paths_in_order:
-                    # ----- MODIFICATION HERE -----
-                    # Use single quotes ' around the path within the concat file.
-                    # This seems more robust with the concat demuxer, especially when using resolved absolute paths.
-                    resolved_path_str = str(clip_path.resolve()).replace('\\', '/')
-                    f.write(f"file '{resolved_path_str}'\n")
-                    # ----- END MODIFICATION -----
-            logger.info(f"Created final movie concat list: {final_concat_list_path.name}")
+             with open(final_concat_list_path, "w", encoding="utf-8") as f:
+                 logger.debug(f"Writing final concat list ({final_concat_list_path.name}) with {len(final_clip_paths_in_order)} entries.")
+                 for clip_path in final_clip_paths_in_order:
+                     resolved_path_str = str(clip_path.resolve()).replace('\\', '/')
+                     f.write(f"file '{resolved_path_str}'\n")
+             logger.info(f"Created final movie concat list: {final_concat_list_path.name}")
         except IOError as e:
-            logger.error(f"CRITICAL: Failed to write final concat list {final_concat_list_path}: {e}")
-            self._cleanup_temp_files([final_concat_list_path], "list write failure")
-            # Keep generated_sentence_clips
-            return None
+             logger.error(f"CRITICAL: Failed to write final concat list {final_concat_list_path}: {e}")
+             # Only cleanup the list file itself on write failure
+             self._cleanup_temp_files([final_concat_list_path], "list write failure")
+             # Keep generated_sentence_clips
+             return None
 
-
-        # --- Step 3: Concatenate Final Clips (Forced Re-encode + Optional Audio Map) ---
+        # --- Step 3: Concatenate Final Clips (Forced Re-encode + Optional Map) ---
         logger.info(f"Concatenating {len(final_clip_paths_in_order)} clips into {self.final_movie_path} (re-encode)...")
-        # Added -map 0:a? to explicitly try mapping audio
+        # Use optional maps for robustness in case a verified clip somehow misses a stream type
         final_concat_cmd_reencode = [
             "-y", "-f", "concat", "-safe", "0", "-i", str(final_concat_list_path.resolve()),
-            "-map", "0:v", "-map", "0:a", # Explicit map video, optional map audio
-            "-c:v", "libx264", "-preset", "medium", "-crf", "22",
-            "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "+faststart",
-            str(self.final_movie_path.resolve())
+            "-map", "0:v?", "-map", "0:a?", # Use optional maps streams from input 0
+            "-c:v", "libx264", "-preset", "medium", "-crf", "22", # Video Encode settings
+            "-c:a", "aac", "-b:a", "192k",                         # Audio Encode settings
+            "-movflags", "+faststart",                             # Optimize for web streaming
+            str(self.final_movie_path.resolve())                   # Output path
         ]
         success, _, stderr_final = await self._run_ffmpeg_async(final_concat_cmd_reencode, "FinalConcat-ReEncode")
 
         if not success:
             logger.error(f"CRITICAL: Final movie concatenation FAILED.")
-            if self.final_movie_path.exists(): 
-                try: self.final_movie_path.unlink() 
+            if self.final_movie_path.exists():
+                try: self.final_movie_path.unlink()
                 except OSError: pass
-            self._cleanup_temp_files([final_concat_list_path], "final concat failure") # Clean list file
-            # Keep verified_clips_for_cleanup (which are a subset of generated)
+            # Keep verified_clips_for_cleanup (the successfully generated sentence clips) and the list file for debugging
+            logger.warning(f"Keeping generated sentence clips in {self.clip_dir} and list {final_concat_list_path.name} for debugging.")
+            self._cleanup_temp_files([], "final concat failure - keep sentence clips") # Minimal cleanup of other temps if any
             return None
         else:
              final_movie_size = self.final_movie_path.stat().st_size if self.final_movie_path.exists() else -1
              logger.info(f"Final movie concatenation successful ({final_movie_size} bytes).")
 
 
-        # --- Step 4: Final Verification (using enhanced check) ---
+        # --- Step 4: Final Verification ---
         logger.info(f"Verifying final movie streams: {self.final_movie_path}")
         final_has_video, video_details = await self._check_stream_details(self.final_movie_path, 'video')
         final_has_audio, audio_details = await self._check_stream_details(self.final_movie_path, 'audio')
@@ -420,7 +528,6 @@ class FFmpegAssembler:
              logger.error(f"  Audio stream: {final_has_audio} ({audio_details})")
              logger.warning("The final movie is likely corrupted or incomplete.")
              logger.warning(f"Keeping generated sentence clips in {self.clip_dir} and list {final_concat_list_path.name} for debugging.")
-             # DO NOT clean verified_clips_for_cleanup or final_concat_list_path
              self._cleanup_temp_files([], "final verification failed - keep sentence clips") # Minimal cleanup
              return None
         else:
@@ -434,13 +541,13 @@ class FFmpegAssembler:
         self._cleanup_temp_files(files_to_cleanup_finally, "final success")
 
         duration = time.monotonic() - start_time
-        logger.info(f"--- Final Movie Assembly V4 Successful ({duration:.3f}s) ---")
+        logger.info(f"--- Final Movie Assembly V5 Successful ({duration:.3f}s) ---")
         logger.info(f"Output file: {self.final_movie_path}")
         return self.final_movie_path
 
 
     def _cleanup_temp_files(self, files_to_delete: List[Path], stage_info: str ="cleanup"):
-        # (Remains same as V3)
+        """Cleans up specified files (list files, intermediate clips)."""
         if not files_to_delete: logger.debug(f"Cleanup ({stage_info}): No files specified."); return
         logger.info(f"Cleanup ({stage_info}): Attempting to delete {len(files_to_delete)} files...")
         deleted_count = 0
@@ -450,11 +557,11 @@ class FFmpegAssembler:
             if file_path_obj.exists():
                 try: file_path_obj.unlink(); deleted_count += 1; logger.debug(f"Cleanup ({stage_info}): Deleted {file_path_obj.name}")
                 except OSError as e: logger.warning(f"Cleanup ({stage_info}): Failed delete {file_path_obj.name}: {e}")
-            else: logger.warning(f"Cleanup ({stage_info}): File not found for deletion: {file_path_obj.name}")
+            # Removed the warning for non-existent files during cleanup, as it can be noisy if cleanup runs multiple times
         logger.info(f"Cleanup ({stage_info}): Finished. Deleted {deleted_count}/{len(files_to_delete)} specified files.")
 
 
-# --- Main Execution Block (Test Logic remains similar) ---
+# --- Main Execution Block (Test Logic) ---
 async def main_test():
     # Configure logging specifically for test
     test_logger = logging.getLogger(__name__)
@@ -466,8 +573,8 @@ async def main_test():
         test_logger.addHandler(console_handler)
         test_logger.propagate = False
 
-    print("--- Running FFmpegAssembler Test (Conceptual V4) ---")
-    assembler = FFmpegAssembler(final_movie_path="test_output_v4.mp4")
+    print("--- Running FFmpegAssembler Test (Conceptual V5 - Robust Checks) ---")
+    assembler = FFmpegAssembler(final_movie_path="test_output_v5.mp4")
 
     # --- Basic Command Checks ---
     print("\nTesting ffmpeg -version...")
@@ -479,7 +586,7 @@ async def main_test():
 
     # --- Test _check_stream_details ---
     print("\nTesting _check_stream_details...")
-    dummy_file_path = Path("dummy_check_v4.txt")
+    dummy_file_path = Path("dummy_check_v5.txt")
     try:
         dummy_file_path.touch()
         print(f"\nTesting details on dummy file ({dummy_file_path}):")
@@ -492,7 +599,7 @@ async def main_test():
          if dummy_file_path.exists(): dummy_file_path.unlink()
 
     # --- Test on actual media if available ---
-    silent_vid_path = Path("silent_video.mp4")
+    silent_vid_path = Path("silent_video.mp4") # Create a short, silent mp4 for testing if needed
     if silent_vid_path.exists():
         print(f"\nTesting details on '{silent_vid_path}' (EXPECTED: Video=True, Audio=False):")
         try:
@@ -503,9 +610,9 @@ async def main_test():
         except Exception as e: print(f"Error testing {silent_vid_path}: {e}")
     else: print(f"\nSkipping details check on '{silent_vid_path}' - file not found.")
 
-    example_audio_path = Path("temp_files/audio/audio_ff5bd87305.mp3") # Change if needed
+    example_audio_path = Path("temp_files/audio/audio_ff5bd87305.mp3") # Example from previous runs
     if example_audio_path.exists():
-        print(f"\nTesting details on '{example_audio_path.name}' (EXPECTED: Audio=True):")
+        print(f"\nTesting details on '{example_audio_path.name}' (EXPECTED: Audio=True, Video=False):")
         try:
              has_aud, details_aud = await assembler._check_stream_details(example_audio_path, 'audio')
              print(f"  -> Has Audio: {has_aud}, Details: {details_aud}")
@@ -514,7 +621,10 @@ async def main_test():
         except Exception as e: print(f"Error testing {example_audio_path.name}: {e}")
     else: print(f"\nSkipping details check on '{example_audio_path.name}' - file not found.")
 
-    print("\n--- End of ffmpeg_assembler_.py Test V4 ---")
+
+    print("\nNOTE: Full `assemble_movie` test requires a populated cache from storyshot_.py.")
+    print("\n--- End of ffmpeg_assembler_.py Test V5 ---")
+
 
 if __name__ == "__main__":
     if sys.platform == "win32" and sys.version_info >= (3, 8):
