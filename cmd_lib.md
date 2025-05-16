@@ -8,3 +8,7 @@ which ffmpeg
 export PATH=$PATH:/usr/bin/ffmpeg
 source ~/.bashrc
 sudo chmod +x /usr/bin/ffmpeg
+git pull && git status
+git status
+git add -A && git commit -m "added prompt2image_fal_.py"
+git push
