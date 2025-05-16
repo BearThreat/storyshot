@@ -1,68 +1,78 @@
 # File: prompt2image_fal_.py
 """
-Prompt-to-Image Module using Fal.ai (prompt2image_fal_.py) - V2 (Async Fix)
+Prompt-to-Image Module using Fal.ai (prompt2image_fal_.py)
+Version: 4.0.0 (Based on V3.0.6 REST API logic)
+Date: 2025-05-16
 
-Handles generating images from text prompts using a Fal.ai endpoint,
-hypothetically "fal-ai/gpt-image-1/text-to-image". This implies Fal is
-providing access to OpenAI's gpt-image-1 technology.
+Handles generating images from text prompts using Fal.ai's queue system directly
+via REST API calls. This module was specifically refactored to use the REST API
+because an official 'cost' or precise 'inference_time' (for billing calculation)
+was not reliably exposed by the high-level `fal-ai` Python library's abstractions
+(e.g., `fal.submit_async()` and `handler.get()`) for the target image generation model
+(e.g., "fal-ai/gpt-image-1/text-to-image") at the time of development.
 
-*** RATE LIMIT NOTE ***
-Fal.ai will have its own rate limits for any given model endpoint.
-The orchestrator may need to implement throttling (e.g., using asyncio.Semaphore
-or delays between batches) to avoid hitting this limit. A placeholder rate limit
-is used in the test section.
+By interacting directly with the Fal.ai REST queue API, this module can:
+1. Submit an image generation request.
+2. Poll the job's status URL.
+3. Upon job completion, retrieve the final response which, according to Fal.ai's
+   queue API documentation, should include a `metrics` object containing
+   `inference_time`, and/or potentially a direct `cost` field.
 
-API Info (Fal.ai - assuming gpt-image-1 endpoint):
-- Docs: Check Fal.ai documentation for the specific model ID.
-- Authentication: FAL_KEY environment variable.
-- Client Library: `fal-ai` (pip install fal-ai)
-- Model: Specified by `FALAI_IMAGE_MODEL` env var (e.g., "fal-ai/gpt-image-1/text-to-image").
-- Endpoint: Managed by the `fal-ai` library via `fal.submit_async()` and `handler.get()`.
-- Key Input Parameters (Assumed based on gpt-image-1):
-    - `prompt`: The text description for the image.
-    - `image_size`: Image dimensions (e.g., "1024x1024", "auto").
-    - `quality`: "low", "medium", "high", "auto".
-    - `background`: "transparent", "opaque", "auto".
-    - `num_images`: Defaults to 1 (fixed at 1 in this script).
-- Key Output (from Fal.ai API via library):
-    - Typically a dictionary containing `images`: a list of objects.
-    - Each image object might have `url` and/or `b64_json`.
-    - May include `revised_prompt`.
-    - Expected to include `timings: {'inference_time': ...}` for cost calculation.
-- Cost: Assumed to be based on inference time * price_per_second for the specific Fal model.
-  This script uses a placeholder `FAL_GPT_IMAGE_1_PRICE_PER_SECOND`.
+This allows for more accurate cost tracking and billing duration recording.
 
-Workflow:
-- Input: Text prompt, output path, image generation parameters.
-- Action:
-    1. Call Fal.ai API (`fal.submit_async` then `handler.get`) with the prompt and parameters.
-    2. If successful, retrieve image data (b64 or download from URL).
-    3. Save image to the specified path.
-    4. Calculate cost based on `inference_time` from the response.
-- Output: Dictionary with status, image path, cost, request time, etc.
+*** Fal.ai REST Queue API Workflow Utilized ***
+1.  **Submit Job (POST):**
+    -   URL: `https://queue.fal.run/{FALAI_IMAGE_MODEL_ID}`
+    -   Method: POST
+    -   Authentication: `Authorization: Key YOUR_FAL_KEY_ID:YOUR_FAL_KEY_SECRET` header.
+    -   Body: JSON payload with `prompt`, `image_size`, `quality`, `background`, `num_images`.
+    -   Expected Response: JSON containing `request_id`, `status_url`, `response_url`, `cancel_url`.
 
-Key Features & Outputs:
-- Async Ready: Uses `async`/`await` and the `fal-ai` async capabilities.
-- Cost Tracking: Estimates cost per request based on inference time. Maintains a running total.
-- Timing Tracking: Measures *individual successful API call* duration.
-- Result Dictionary: The `generate_image` method returns a dictionary:
-    {
-        "status": "success" | "failed",
-        "image_path": str | None,
-        "cost": float,
-        "request_time": float, # Duration of this specific successful API call (handler.get wait)
-        "revised_prompt": str | None,
-        "inference_time_sec": float, # Inference time reported by Fal
-        "error_message": str | None
-    }
-- Retries: Implements basic retry logic for transient errors.
+2.  **Poll Status (GET):**
+    -   URL: The `status_url` received from the submission step.
+    -   Method: GET
+    -   Loop: Periodically poll this URL until the job status is terminal (e.g., "COMPLETED", "FAILED").
+    -   Expected status values: "IN_QUEUE", "IN_PROGRESS", "COMPLETED", "FAILED", "CANCELLED", "ERROR".
+    -   Upon "COMPLETED", the status response itself might contain `metrics` (like `inference_time`) and/or `cost`.
 
-Usage Notes / Integration with storyshot_.py:
-- Environment Variables: Requires `FAL_KEY`. Optional: `FALAI_IMAGE_MODEL`, `FAL_GPT_IMAGE_1_PRICE_PER_SECOND`.
-- Dependencies: Requires `fal-ai`, `python-dotenv`, `aiohttp` (for URL downloads).
-- Caching: Calling code manages caching.
-- Concurrency: Designed for concurrent execution, be mindful of Fal.ai rate limits.
-- Error Handling: Raises `PromptToImageFalError` on failure after retries or returns dict with status.
+3.  **Fetch Result (GET):**
+    -   URL: The `response_url` received from the submission step (or potentially from status updates).
+    -   Method: GET
+    -   This is fetched once the status is "COMPLETED".
+    -   Expected Response: JSON containing the primary output of the function (e.g., an `images` array)
+      and often repeats or includes definitive `metrics` and/or `cost`.
+      Fal.ai functions typically wrap their output in a "response" key, so the image data might be
+      at `final_result.response.images`.
+
+*** Cost Calculation Logic ***
+The module attempts to determine cost in the following order of preference:
+1.  **Direct `cost` field:** Looks for a `cost` key in the final API response (either from the
+    last status poll if it contained the full result upon completion, or from fetching the dedicated response URL).
+2.  **`metrics.inference_time`:** If a direct cost is not found, it looks for `metrics.inference_time`
+    (in seconds) in the API response. This duration is then multiplied by the configured
+    `FAL_GPT_IMAGE_1_PRICE_PER_SECOND` to estimate the cost.
+3.  **Total Job Wall-Clock Time (Fallback):** If neither direct cost nor `inference_time` is available from the API,
+    the module falls back to using the total measured wall-clock time from job submission to result retrieval
+    for cost estimation. This is the least accurate method and is used as a last resort.
+
+*** Key Module Features ***
+-   Direct Fal.ai REST API interaction using `aiohttp`.
+-   Robust polling mechanism for asynchronous job completion.
+-   Prioritized extraction of official cost/billing metrics from API responses.
+-   Async/await for non-blocking operations.
+-   Configurable retries for job submission.
+-   Detailed logging of the generation process.
+
+*** Environment Variables ***
+-   `FAL_KEY`: Required. Fal.ai API key in `key_id:key_secret` format.
+-   `FALAI_IMAGE_MODEL_ID`: Optional. The Fal.ai application/model ID.
+    Defaults to "fal-ai/gpt-image-1/text-to-image".
+-   `FAL_GPT_IMAGE_1_PRICE_PER_SECOND`: Optional. The estimated price per second of inference time
+    for the target model, used if only duration is available from the API.
+
+*** Dependencies ***
+-   `aiohttp`: For making asynchronous HTTP requests.
+-   `python-dotenv`: For loading environment variables from a .env file.
 """
 
 import os
@@ -72,346 +82,480 @@ import time
 import asyncio
 import base64
 from pathlib import Path
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import Dict, Any, Optional
+import json
 
 from dotenv import load_dotenv
-import fal_client as fal # Using `fal` alias for `fal_client`
-import aiohttp # For downloading images if URL is provided
+import aiohttp
 
 # --- Configuration ---
 load_dotenv()
 FAL_API_KEY = os.getenv("FAL_KEY")
-FALAI_IMAGE_MODEL_DEFAULT = "fal-ai/gpt-image-1/text-to-image"
-FALAI_IMAGE_MODEL = os.getenv("FALAI_IMAGE_MODEL", FALAI_IMAGE_MODEL_DEFAULT)
+FALAI_IMAGE_MODEL_ID = os.getenv("FALAI_IMAGE_MODEL", "fal-ai/gpt-image-1/text-to-image")
 
-FAL_GPT_IMAGE_1_PRICE_PER_SECOND_DEFAULT = "0.0001"
+FAL_GPT_IMAGE_1_PRICE_PER_SECOND_DEFAULT = "0.0016584" # Estimate derived from Fal.ai playground observations
 FAL_GPT_IMAGE_1_PRICE_PER_SECOND = Decimal(os.getenv("FAL_GPT_IMAGE_1_PRICE_PER_SECOND", FAL_GPT_IMAGE_1_PRICE_PER_SECOND_DEFAULT))
 
-PER_MIN_RATE_LIMIT_FAL_TEST = 20 # For testing rate limits (Semaphore setting)
-DEFAULT_API_RETRY_COUNT_FAL = 1
-DEFAULT_TIMEOUT_SECONDS_FAL_TEST = 120 # For aiohttp and potentially Fal calls (if configurable)
+FAL_QUEUE_BASE_URL = "https://queue.fal.run"
+DEFAULT_SUBMIT_TIMEOUT_SEC = 30         # Timeout for the initial job submission POST request.
+DEFAULT_POLLING_INTERVAL_SEC = 2        # How often to poll the status URL.
+DEFAULT_POLLING_TIMEOUT_SEC = 360       # Max time to wait for job completion via polling (increased from 300).
+DEFAULT_RESULT_TIMEOUT_SEC = 60         # Timeout for fetching the final result after COMPLETED status.
+DEFAULT_API_RETRY_COUNT_FAL = 1         # Retries for initial job submission only.
 
-# Test parameters for 'low' quality and smaller size
+# Default image parameters for testing or direct use if not overridden by caller
 DEFAULT_IMAGE_SIZE_FAL_TEST = "1024x1024"
 DEFAULT_IMAGE_QUALITY_FAL_TEST = "low"
 DEFAULT_IMAGE_BACKGROUND_FAL_TEST = "opaque"
 
-# Original defaults (can be used by orchestrator if not testing)
-DEFAULT_IMAGE_SIZE_FAL = "1024x1024"
-DEFAULT_IMAGE_QUALITY_FAL = "medium"
+# Default image parameters for general use (can be overridden by caller)
+DEFAULT_IMAGE_SIZE_FAL = "1024x1024"    # Standard OpenAI DALL-E 3 size
+DEFAULT_IMAGE_QUALITY_FAL = "medium"    # Corresponds to standard "dall-e-3" if Fal maps quality
 DEFAULT_IMAGE_BACKGROUND_FAL = "opaque"
 
-
-# --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-logging.getLogger("fal_client").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("aiohttp").setLevel(logging.WARNING)
+logging.getLogger("aiohttp").setLevel(logging.WARNING) # Keep aiohttp's own logs quieter
 
+class FalApiError(Exception):
+    """Custom exception for Fal REST API interaction errors."""
+    def __init__(self, message, status_code=None, error_body=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_body = str(error_body) # Ensure error_body is string for safe printing
 
-class PromptToImageFalError(Exception):
-    """Custom exception for PromptToImageFal errors."""
-    pass
+    def __str__(self):
+        # Provides a concise string representation for logging.
+        return (f"{super().__str__()} "
+                f"(Status: {self.status_code if self.status_code else 'N/A'}, "
+                f"Body: {self.error_body[:200]}{'...' if len(self.error_body) > 200 else ''})")
 
-class PromptToImageFal:
+class PromptToImageFalRest:
     """
-    Handles image generation using a Fal.ai endpoint (Async, V2 - Async Fix).
-    Tracks estimated costs and timings.
+    Generates images from prompts using Fal.ai's REST queue API for accurate cost/metric tracking.
     """
-    def __init__(self,
-                 api_key: Optional[str] = None,
-                 model_id: str = FALAI_IMAGE_MODEL,
+    def __init__(self, api_key: Optional[str] = None, model_id: str = FALAI_IMAGE_MODEL_ID,
                  price_per_second: Decimal = FAL_GPT_IMAGE_1_PRICE_PER_SECOND,
-                 api_retries: int = DEFAULT_API_RETRY_COUNT_FAL,
-                 timeout: int = DEFAULT_TIMEOUT_SECONDS_FAL_TEST): # Using test default timeout here
+                 submit_retries: int = DEFAULT_API_RETRY_COUNT_FAL, polling_timeout: int = DEFAULT_POLLING_TIMEOUT_SEC):
         self.api_key = api_key or FAL_API_KEY
-        if not self.api_key or ':' not in self.api_key:
-            raise ValueError("Fal API key not found or incorrect format ('key_id:key_secret').")
+        if not self.api_key or ':' not in self.api_key: # Fal keys are typically key_id:key_secret
+            raise ValueError("Fal API key not found or in incorrect format ('key_id:key_secret'). Check FAL_KEY environment variable.")
         
         self.model_id = model_id
         self.price_per_second = price_per_second
-        self.api_retries = api_retries
-        self.timeout = timeout # For aiohttp and potentially Fal timeout if handler supports
+        self.submit_retries = submit_retries
+        self.polling_timeout = polling_timeout
+        self.submit_url = f"{FAL_QUEUE_BASE_URL}/{self.model_id}"
+        # Base headers for authenticated Fal.ai API calls. Content-Type added by _make_request for POST.
+        self._base_headers = {"Authorization": f"Key {self.api_key}", "Accept": "application/json"}
 
+        # Tracking metrics
         self.total_requests = 0; self.total_successful_requests = 0; self.total_failed_requests = 0
-        self.total_estimated_cost = Decimal("0.0")
-        self.total_successful_request_duration_sum = 0.0
-        self.total_inference_time_sec = 0.0
+        self.total_accumulated_cost = Decimal("0.0")
+        self.total_api_call_duration_sum_successful = 0.0 # Sum of wall-clock time for successful generate_image calls
+        self.total_billing_duration_sec_sum_successful = 0.0 # Sum of API-reported billing durations for successful calls
         self._session: Optional[aiohttp.ClientSession] = None
-        logger.info(f"PromptToImageFal V2 initialized. Model: {self.model_id}. Price: ${self.price_per_second}/sec.")
+        logger.info(f"PromptToImageFalRest (v4.0.0) initialized. Model ID: {self.model_id}. Price/Sec (for calc): ${self.price_per_second:.8f}")
 
     async def _get_session(self) -> aiohttp.ClientSession:
+        """Ensures an active aiohttp.ClientSession is available."""
         if self._session is None or self._session.closed:
-            timeout_config = aiohttp.ClientTimeout(total=self.timeout)
-            self._session = aiohttp.ClientSession(timeout=timeout_config)
+            self._session = aiohttp.ClientSession()
         return self._session
 
     async def close_session(self):
+        """Closes the aiohttp.ClientSession if it's open."""
         if self._session and not self._session.closed:
-            await self._session.close(); self._session = None
-            logger.info("Aiohttp session closed for PromptToImageFal.")
-            
-    def _calculate_cost(self, inference_time_sec: float) -> Decimal:
-        if inference_time_sec <= 0: return Decimal("0.0")
-        return (Decimal(str(inference_time_sec)) * self.price_per_second).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+            await self._session.close()
+            self._session = None
+            logger.info("Aiohttp session closed for PromptToImageFalRest.")
 
-    async def generate_image(
-        self,
-        prompt: str,
-        output_image_path: str | Path,
-        size: str = DEFAULT_IMAGE_SIZE_FAL,      # Using original defaults
-        quality: str = DEFAULT_IMAGE_QUALITY_FAL,  # Using original defaults
-        background: str = DEFAULT_IMAGE_BACKGROUND_FAL, # Using original defaults
-        semaphore: Optional[asyncio.Semaphore] = None
-    ) -> Dict[str, Any]:
+    def _calculate_cost_from_duration(self, duration_sec: float) -> Decimal:
+        """Calculates cost based on duration and configured price per second."""
+        if duration_sec <= 0: return Decimal("0.0")
+        try:
+            return (Decimal(str(duration_sec)) * self.price_per_second).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+        except InvalidOperation: # Handles non-finite float values if they somehow occur
+            logger.error(f"Invalid duration value for cost calculation: {duration_sec}")
+            return Decimal("0.0")
+
+    async def _make_request(self, method: str, url: str, timeout_sec: int, 
+                            is_json_response: bool = True, data: Optional[Any] = None, 
+                            custom_headers: Optional[Dict[str,str]] = None) -> Any:
+        """
+        Makes an asynchronous HTTP request.
+        Handles common errors, timeouts, and response parsing.
+        """
+        session = await self._get_session()
+        
+        headers_to_use = self._base_headers.copy()
+        if custom_headers is not None: # If an empty dict {} is passed, it effectively clears auth for public URLs
+            headers_to_use = custom_headers 
+        
+        if method.upper() == "POST" and data is not None:
+            if 'Content-Type' not in headers_to_use: # Only add if not already specified in custom_headers
+                 headers_to_use['Content-Type'] = 'application/json'
+        
+        try:
+            async with session.request(method, url, timeout=aiohttp.ClientTimeout(total=timeout_sec), data=data, headers=headers_to_use) as response:
+                if not (200 <= response.status < 300): # Not a successful HTTP status
+                    response_text = await response.text()
+                    logger.error(f"Fal API Error: {method} {url} - Status {response.status} - Body: {response_text[:500]}")
+                    raise FalApiError(f"API request to {url} failed with status {response.status}", 
+                                      status_code=response.status, error_body=response_text)
+                
+                if not is_json_response: # Expecting binary data (e.g., image)
+                    return await response.read() 
+
+                # Expecting JSON response
+                response_text = await response.text() 
+                try:
+                    return json.loads(response_text)
+                except json.JSONDecodeError as json_err:
+                    logger.error(f"Fal API {method} {url} - Status {response.status} returned non-JSON text that failed to parse: {response_text[:200]}. Error: {json_err}")
+                    raise FalApiError(f"Failed to decode JSON response from {url}. Status: {response.status}", 
+                                      status_code=response.status, error_body=response_text)
+        
+        except asyncio.TimeoutError:
+            logger.error(f"Fal API Timeout: {method} {url} after {timeout_sec}s")
+            raise FalApiError(f"API request to {url} timed out after {timeout_sec}s", status_code=408) # Using 408 for timeout
+        except aiohttp.ClientError as e: # Covers connection errors, etc.
+            logger.error(f"Fal API ClientError: {method} {url} - {type(e).__name__}: {e}")
+            raise FalApiError(f"API client error ({type(e).__name__}) for {url}: {e}")
+
+
+    async def generate_image(self, prompt: str, output_image_path: Path, 
+                             size: str = DEFAULT_IMAGE_SIZE_FAL, quality: str = DEFAULT_IMAGE_QUALITY_FAL, 
+                             background: str = DEFAULT_IMAGE_BACKGROUND_FAL, 
+                             semaphore: Optional[asyncio.Semaphore] = None) -> Dict[str, Any]:
+        """
+        Orchestrates the image generation process: submit, poll, get result, process.
+        """
         if semaphore: await semaphore.acquire()
 
-        try:
-            self.total_requests += 1
-            overall_start_time = time.monotonic()
-            output_path = Path(output_image_path)
-            log_prefix = f"Fal Img ({self.model_id.split('/')[-1]}, {size}, {quality} -> {output_path.name})"
-            logger.info(f"{log_prefix}: Requesting image for prompt: \"{prompt[:60]}...\"")
-
-            try: output_path.parent.mkdir(parents=True, exist_ok=True)
-            except OSError as e:
-                 logger.error(f"{log_prefix}: Failed to create output dir {output_path.parent}: {e}")
-                 self.total_failed_requests += 1
-                 return {"status": "failed", "image_path": None, "cost": 0.0, "request_time": time.monotonic() - overall_start_time, "revised_prompt": None, "inference_time_sec": 0.0, "error_message": f"Failed to create output dir: {e}"}
-
-            result_dict = {"status": "failed", "image_path": None, "cost": 0.0, "request_time": 0.0, "revised_prompt": None, "inference_time_sec": 0.0, "error_message": "Unknown."}
-            arguments = {"prompt": prompt, "image_size": size, "quality": quality, "background": background, "num_images": 1}
-            arguments = {k: v for k, v in arguments.items() if v is not None}
-            logger.debug(f"{log_prefix}: Calling Fal with args: {arguments}")
-
-            attempts = 0; last_exception = None; response_data = None
-            actual_api_request_duration = 0.0
-
-            while attempts <= self.api_retries:
-                # --- Timing for API submission and result retrieval ---
-                submit_and_get_start_time = time.monotonic() 
-                handler = None # Define handler outside try for potential access in error logging
-                try:
-                    logger.debug(f"{log_prefix}: Fal API call attempt {attempts + 1}/{self.api_retries + 1}")
-                    
-                    # Async submission
-                    handler = await fal.submit_async(self.model_id, arguments=arguments)
-                    # Wait for the result
-                    response_data = await handler.get() # This is where most of the waiting happens
-
-                    actual_api_request_duration = time.monotonic() - submit_and_get_start_time
-                    logger.debug(f"{log_prefix}: Fal API call successful (Attempt {attempts + 1}). Total wait for result: {actual_api_request_duration:.3f}s")
-
-                    if not response_data or not isinstance(response_data, dict):
-                        raise PromptToImageFalError(f"Fal API response invalid. Type: {type(response_data)}")
-
-                    images_data = response_data.get("images")
-                    if not images_data or not isinstance(images_data, list) or not images_data[0]:
-                        raise PromptToImageFalError("API response missing 'images' or empty list.")
-
-                    image_info = images_data[0]
-                    image_b64 = image_info.get("b64_json"); image_url = image_info.get("url")
-                    revised_prompt = response_data.get("revised_prompt") 
-                    
-                    timings = response_data.get("timings", {})
-                    inference_time_sec = float(timings.get("inference_time", 0.0))
-                    if inference_time_sec == 0.0 and actual_api_request_duration > 0:
-                        logger.warning(f"{log_prefix}: Fal 'inference_time' 0.0. Using API wait ({actual_api_request_duration:.3f}s) for cost.")
-                        inference_time_sec = actual_api_request_duration
-
-                    estimated_cost = self._calculate_cost(inference_time_sec)
-                    logger.debug(f"{log_prefix}: Inference reported: {inference_time_sec:.3f}s. Cost: ${estimated_cost:.6f}")
-
-                    image_bytes = None
-                    if image_b64:
-                        try: image_bytes = base64.b64decode(image_b64)
-                        except Exception as e: raise PromptToImageFalError(f"Base64 decode error: {e}")
-                    elif image_url:
-                        logger.info(f"{log_prefix}: Downloading from URL: {image_url}")
-                        session = await self._get_session()
-                        try:
-                            async with session.get(image_url) as resp:
-                                if resp.status == 200: image_bytes = await resp.read()
-                                else:
-                                    error_text = await resp.text()
-                                    raise PromptToImageFalError(f"Download fail ({resp.status}): {error_text[:200]}")
-                        except aiohttp.ClientError as e: raise PromptToImageFalError(f"Download net error: {e}")
-                    else: raise PromptToImageFalError("No b64_json or URL in response.")
-
-                    if not image_bytes: raise PromptToImageFalError("Image_bytes empty.")
-
-                    try:
-                        with open(output_path, "wb") as f: f.write(image_bytes)
-                        logger.info(f"{log_prefix}: Image saved to {output_path}")
-                    except Exception as e: raise PromptToImageFalError(f"Save image error: {e}")
-
-                    self.total_successful_requests += 1; self.total_estimated_cost += estimated_cost
-                    self.total_successful_request_duration_sum += actual_api_request_duration
-                    self.total_inference_time_sec += inference_time_sec
-                    result_dict.update({"status": "success", "image_path": str(output_path), "cost": float(estimated_cost), "request_time": actual_api_request_duration, "revised_prompt": revised_prompt, "inference_time_sec": inference_time_sec, "error_message": None})
-                    return result_dict
-
-                # --- Error Handling (Corrected Fal client errors) ---
-                except (fal.api.FalServerException, fal.api.HTTPError, fal_client.RequestError, fal_client.client.FalClientError) as e:
-                    last_exception = e; actual_api_request_duration = time.monotonic() - submit_and_get_start_time
-                    error_details = str(e)
-                    if hasattr(e, 'request_id') and e.request_id: error_details += f" (Request ID: {e.request_id})"
-                    if hasattr(handler, 'request_id') and handler.request_id and 'Request ID' not in error_details: error_details += f" (Handler Request ID: {handler.request_id})"
-
-                    logger.warning(f"{log_prefix}: Fal Client/API Error (Attempt {attempts + 1}): {type(e).__name__} - {error_details} (Duration: {actual_api_request_duration:.3f}s)")
-                except PromptToImageFalError as e: 
-                    last_exception = e; actual_api_request_duration = time.monotonic() - submit_and_get_start_time
-                    logger.error(f"{log_prefix}: Processing error (Attempt {attempts + 1}): {e} (Duration: {actual_api_request_duration:.3f}s)")
-                    result_dict["error_message"] = str(e); result_dict["request_time"] = actual_api_request_duration
-                    self.total_failed_requests += 1
-                    return result_dict 
-                except aiohttp.ClientError as e: 
-                    last_exception = e; actual_api_request_duration = time.monotonic() - submit_and_get_start_time
-                    logger.warning(f"{log_prefix}: Image download net error (Attempt {attempts + 1}): {e} (Duration: {actual_api_request_duration:.3f}s)")
-                except Exception as e: 
-                    last_exception = e; actual_api_request_duration = time.monotonic() - submit_and_get_start_time
-                    logger.error(f"{log_prefix}: Unexpected error (Attempt {attempts + 1}) [{type(e).__name__}]: {e} (Duration: {actual_api_request_duration:.3f}s)", exc_info=True)
-                    result_dict["error_message"] = f"Unexpected: {type(e).__name__}: {e}"; result_dict["request_time"] = actual_api_request_duration
-                    self.total_failed_requests +=1
-                    return result_dict
-
-                attempts += 1
-                if attempts <= self.api_retries:
-                    wait_time = 2 ** (attempts - 1) 
-                    logger.info(f"{log_prefix}: Retrying in {wait_time}s...")
-                    await asyncio.sleep(wait_time)
-                else:
-                    logger.error(f"{log_prefix}: Max retries reached. Failed.")
-                    self.total_failed_requests += 1
-                    final_duration = time.monotonic() - overall_start_time
-                    if last_exception: result_dict["error_message"] = f"Failed after {self.api_retries+1} attempts. Last: {type(last_exception).__name__}: {last_exception}"
-                    else: result_dict["error_message"] = f"Failed after {self.api_retries+1} attempts."
-                    result_dict["request_time"] = final_duration 
-                    if output_path.exists() and result_dict["status"] == "failed":
-                        try: output_path.unlink()
-                        except OSError as rm_err: logger.warning(f"{log_prefix}: Failed to remove {output_path}: {rm_err}")
-                    return result_dict
-        finally:
-            if semaphore: semaphore.release()
+        overall_start_time = time.monotonic()
+        self.total_requests += 1
+        log_prefix = f"FalImgRST ({self.model_id.split('/')[-1]} -> {output_image_path.name})"
         
-        result_dict["request_time"] = time.monotonic() - overall_start_time
+        result_dict: Dict[str, Any] = {
+            "status": "failed", "image_path": None, "cost": 0.0, "api_call_duration_sec": 0.0, 
+            "billing_duration_sec": 0.0, "revised_prompt": None, "error_message": "Process initiated.",
+            "fal_request_id": None, "raw_final_response_snippet": None
+        }
+
+        try: 
+            output_image_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {k:v for k,v in {"prompt":prompt,"image_size":size,"quality":quality,"background":background,"num_images":1}.items() if v is not None}
+
+            # --- 1. Submit Job ---
+            fal_request_id, status_url, response_url_from_submit = None, None, None
+            submit_attempts = 0
+            while submit_attempts <= self.submit_retries:
+                try:
+                    logger.debug(f"{log_prefix}: Submitting job (Attempt {submit_attempts + 1})")
+                    submit_data = await self._make_request("POST", self.submit_url, DEFAULT_SUBMIT_TIMEOUT_SEC, data=json.dumps(payload))
+                    fal_request_id = submit_data.get("request_id")
+                    status_url = submit_data.get("status_url")
+                    response_url_from_submit = submit_data.get("response_url")
+                    if not all([fal_request_id, status_url, response_url_from_submit]):
+                        raise FalApiError("Submission response missing critical fields (request_id, status_url, or response_url).", error_body=submit_data)
+                    logger.info(f"{log_prefix}: Job submitted. Request ID: {fal_request_id}.")
+                    result_dict["fal_request_id"] = fal_request_id
+                    break # Successful submission
+                except FalApiError as e:
+                    submit_attempts += 1
+                    logger.warning(f"{log_prefix}: Submission failed (Attempt {submit_attempts}): {e}")
+                    if submit_attempts > self.submit_retries:
+                        result_dict["error_message"] = f"Failed to submit job after {submit_attempts} attempts: {e}"
+                        raise # Propagate to outer try-finally, which will then populate result_dict before returning
+                    await asyncio.sleep(2**(submit_attempts-1)) # Exponential backoff
+            
+            # --- 2. Poll Status ---
+            polling_start_time = time.monotonic()
+            final_status_data = None # Store data from the COMPLETED status poll
+            while True: 
+                if time.monotonic() - polling_start_time > self.polling_timeout:
+                    raise FalApiError(f"Polling timed out for request {fal_request_id} after {self.polling_timeout}s.", status_code=408) # Poll timeout
+                
+                try:
+                    # Use "?logs=0" to keep status poll response lean unless debugging Fal function itself.
+                    status_data = await self._make_request("GET", status_url + "?logs=0", DEFAULT_SUBMIT_TIMEOUT_SEC) 
+                    current_status = status_data.get("status")
+                    logger.info(f"{log_prefix}: Request {fal_request_id} status: {current_status} (Queue Pos: {status_data.get('queue_position','N/A')})")
+
+                    if current_status == "COMPLETED":
+                        final_status_data = status_data # This data might contain metrics/cost.
+                        break # Exit polling loop
+                    elif current_status in ["IN_QUEUE", "IN_PROGRESS"]:
+                        await asyncio.sleep(DEFAULT_POLLING_INTERVAL_SEC)
+                    elif current_status in ["FAILED", "CANCELLED", "ERROR"]: # Terminal failure states from Fal
+                        raise FalApiError(f"Job {fal_request_id} ended with Fal status: {current_status}", 
+                                          status_code=500, # Generic server-side type error from Fal's perspective
+                                          error_body=str(status_data)[:500]) # Keep error concise
+                    else: # Unknown or unexpected status from Fal
+                        raise FalApiError(f"Job {fal_request_id} returned unknown status from Fal: {current_status}", 
+                                          error_body=str(status_data)[:500])
+                except FalApiError as e_poll: # Error during a poll GET request itself
+                    logger.warning(f"{log_prefix}: Error during status poll for {fal_request_id}: {e_poll}. Retrying poll after delay.")
+                    await asyncio.sleep(DEFAULT_POLLING_INTERVAL_SEC * 2) # Wait a bit longer if poll GET fails
+            
+            # --- 3. Fetch Final Result ---
+            logger.info(f"{log_prefix}: Job {fal_request_id} COMPLETED. Fetching final result from {response_url_from_submit}")
+            final_result_data = await self._make_request("GET", response_url_from_submit, DEFAULT_RESULT_TIMEOUT_SEC)
+            result_dict["raw_final_response_snippet"] = str(final_result_data)[:1000]
+            
+            # --- 4. Extract Data, Cost, and Save Image ---
+            extracted_cost, billing_duration_sec, cost_source = Decimal("0.0"), 0.0, "calculated"
+            
+            # Consolidate data for extraction: prefer final_result_data, fallback to final_status_data
+            data_to_parse_metrics_from = final_result_data if isinstance(final_result_data, dict) else {}
+            
+            api_cost_value = data_to_parse_metrics_from.get('cost')
+            if api_cost_value is None and isinstance(final_status_data, dict): # Check status data if not in final result
+                api_cost_value = final_status_data.get('cost')
+
+            api_metrics_object = data_to_parse_metrics_from.get('metrics')
+            if api_metrics_object is None and isinstance(final_status_data, dict): # Check status data
+                api_metrics_object = final_status_data.get('metrics')
+
+            if api_cost_value is not None: # Direct cost found
+                try: extracted_cost = Decimal(str(api_cost_value)); cost_source = "direct_api_cost"
+                except InvalidOperation: logger.warning(f"{log_prefix}: Invalid 'cost' value from API: {api_cost_value}")
+            
+            if isinstance(api_metrics_object, dict) and "inference_time" in api_metrics_object:
+                try: billing_duration_sec = float(api_metrics_object["inference_time"])
+                except (ValueError, TypeError): logger.warning(f"{log_prefix}: Invalid 'inference_time' value: {api_metrics_object.get('inference_time')}")
+            
+            # Finalize cost calculation
+            if cost_source == "direct_api_cost":
+                logger.info(f"{log_prefix}: Cost directly from API: ${extracted_cost:.6f}. API Billing Duration (if provided): {billing_duration_sec:.3f}s")
+            elif billing_duration_sec > 0: # Calculate cost from API-reported billing duration
+                extracted_cost = self._calculate_cost_from_duration(billing_duration_sec)
+                logger.info(f"{log_prefix}: Cost calculated from API billing duration: ${extracted_cost:.6f} (Duration: {billing_duration_sec:.3f}s)")
+            else: # Fallback: no direct cost, no API billing duration. Use total job wall-clock time.
+                current_job_duration_wc = time.monotonic() - overall_start_time 
+                extracted_cost = self._calculate_cost_from_duration(current_job_duration_wc)
+                billing_duration_sec = current_job_duration_wc # Record this wall-clock time as the billing_duration
+                cost_source = "calculated_total_job_wallclock_time"
+                logger.warning(f"{log_prefix}: No direct cost or API inference_time. Cost estimated using total job wall-clock time ({current_job_duration_wc:.3f}s): ${extracted_cost:.6f}")
+            
+            result_dict.update({"cost": float(extracted_cost), "billing_duration_sec": billing_duration_sec})
+
+            # Extract image data: Fal often wraps actual output in a "response" key
+            actual_response_content = data_to_parse_metrics_from.get("response", data_to_parse_metrics_from) # Default to data_to_parse anw
+            if not isinstance(actual_response_content, dict): 
+                raise FalApiError(f"Expected dictionary for actual response content, got {type(actual_response_content)}", 
+                                  error_body=str(actual_response_content)[:200])
+            
+            images_list = actual_response_content.get("images")
+            result_dict["revised_prompt"] = actual_response_content.get("revised_prompt") # Common for DALL-E type models
+            if not images_list or not isinstance(images_list, list) or not images_list[0]: 
+                raise FalApiError("No 'images' array found in the final response content.", 
+                                  error_body=str(actual_response_content)[:200])
+
+            image_info = images_list[0]
+            image_b64_data, image_url_data = image_info.get("b64_json"), image_info.get("url")
+            image_bytes_content = None
+
+            if image_b64_data:
+                try: image_bytes_content = base64.b64decode(image_b64_data)
+                except Exception as e_b64: logger.warning(f"{log_prefix}: Base64 decoding error: {e_b64}. Will attempt URL download if available."); image_bytes_content=None
+            
+            if not image_bytes_content and image_url_data: # If b64 failed or not present, try URL
+                logger.info(f"{log_prefix}: Downloading image from URL: {image_url_data}")
+                # For public image URLs (like from Fal CDN), no auth headers are typically needed or wanted.
+                image_bytes_content = await self._make_request("GET", image_url_data, DEFAULT_RESULT_TIMEOUT_SEC, 
+                                                             is_json_response=False, custom_headers={}) # Pass empty dict for no auth
+            
+            if not image_bytes_content: raise FalApiError("Failed to obtain image bytes from b64 or URL.")
+            
+            with open(output_image_path, "wb") as f: f.write(image_bytes_content)
+            logger.info(f"{log_prefix}: Image successfully saved to {output_image_path}")
+            
+            # Mark as overall success
+            result_dict.update({"status": "success", "image_path": str(output_image_path), "error_message": None})
+            self.total_successful_requests += 1
+            self.total_accumulated_cost += extracted_cost
+            self.total_billing_duration_sec_sum_successful += billing_duration_sec # Add API reported/calculated billing time
+        
+        except FalApiError as e_api: # Catch specific API errors from our logic or _make_request
+            logger.error(f"{log_prefix}: Fal API processing chain error: {e_api}")
+            # Ensure error_message in result_dict is updated if it was a more generic one before
+            if not result_dict.get("error_message") or result_dict.get("error_message") == "Process initiated.":
+                 result_dict["error_message"] = str(e_api)
+        except Exception as e_general: # Catch any other unexpected errors during the process
+            logger.error(f"{log_prefix}: Unexpected error during image generation: {type(e_general).__name__} - {e_general}", exc_info=True)
+            if not result_dict.get("error_message") or result_dict.get("error_message") == "Process initiated.":
+                result_dict["error_message"] = f"Unexpected error: {type(e_general).__name__} - {e_general}"
+        finally:
+            current_wall_clock_duration = time.monotonic() - overall_start_time
+            result_dict["api_call_duration_sec"] = current_wall_clock_duration # Record total wall-clock time
+            
+            # If successful, add wall-clock time to its sum
+            if result_dict.get("status") == "success": 
+                self.total_api_call_duration_sum_successful += current_wall_clock_duration
+            
+            # If request failed for any reason AND it hasn't been counted as FAILED yet
+            if result_dict.get("status") == "failed" and \
+               self.total_requests > (self.total_successful_requests + self.total_failed_requests):
+                self.total_failed_requests += 1
+                
+            if semaphore: semaphore.release()
+            
         return result_dict
 
-
     def get_stats(self) -> Dict[str, Any]:
-        return {"total_requests": self.total_requests, "successful": self.total_successful_requests, "failed": self.total_failed_requests, "total_estimated_cost": self.total_estimated_cost, "total_successful_request_duration_sum": self.total_successful_request_duration_sum, "total_inference_time_sec_all_successful": self.total_inference_time_sec}
+        """Returns a dictionary of accumulated operational statistics."""
+        return {
+            "total_requests_attempted": self.total_requests, 
+            "total_requests_successful": self.total_successful_requests, 
+            "total_requests_failed": self.total_failed_requests, 
+            "total_accumulated_cost_successful": self.total_accumulated_cost, 
+            "total_api_call_duration_sum_successful_sec": self.total_api_call_duration_sum_successful, 
+            "total_billing_duration_sum_successful_sec": self.total_billing_duration_sec_sum_successful
+        }
 
-# --- Main Execution Block (for testing) ---
-async def run_fal_image_gen_task(handler: PromptToImageFal, prompt: str, output_path: Path, task_id: int, semaphore: asyncio.Semaphore, size: str, quality:str, background: str):
-    logger.info(f"--- Fal Task {task_id}: Waiting for semaphore ---")
-    result = await handler.generate_image(prompt=prompt, output_image_path=output_path, size=size, quality=quality, background=background, semaphore=semaphore)
-    logger.info(f"--- Fal Task {task_id}: Finished ---")
+# --- Task Runner Helper ---
+async def run_fal_image_gen_task_rest(handler: PromptToImageFalRest, prompt_str: str, 
+                                      out_path: Path, task_id: int, sem: asyncio.Semaphore, 
+                                      size_str: str, quality_str: str, background_str: str) -> Dict[str, Any]:
+    """Helper coroutine to run a single image generation task."""
+    logger.info(f"--- Fal REST Task {task_id}: Waiting for semaphore for prompt '{prompt_str[:30]}...' ---")
+    result = await handler.generate_image(
+        prompt=prompt_str, output_image_path=out_path, size=size_str, 
+        quality=quality_str, background=background_str, semaphore=sem
+    )
+    
+    error_msg_val = result.get('error_message')
+    error_msg_display = 'N/A'
+    if error_msg_val is not None:
+        error_msg_str = str(error_msg_val)
+        error_msg_display = (error_msg_str[:100] + '...' if len(error_msg_str) > 100 else error_msg_str)
+    
+    logger.info(f"--- Fal REST Task {task_id}: Finished with Status: {result.get('status')}. Error: {error_msg_display} ---")
     return result
-
-async def main_test_fal():
-    print("--- Running PromptToImageFal Test (V2 Async Fix) ---")
+    
+# --- Main Execution Block (for testing this module standalone) ---
+async def main_test_fal_rest():
+    """Main function to test the PromptToImageFalRest class."""
+    print("--- Running PromptToImageFalRest Test (V4.0.0 - REST API) ---")
     if not FAL_API_KEY or ':' not in FAL_API_KEY:
-        print("Error: FAL_KEY not found or incorrect format.", file=sys.stderr); return
-
-    print(f"Using Fal Model ID: {FALAI_IMAGE_MODEL}")
-    print(f"Test Params: Size='{DEFAULT_IMAGE_SIZE_FAL_TEST}', Quality='{DEFAULT_IMAGE_QUALITY_FAL_TEST}', Timeout='{DEFAULT_TIMEOUT_SECONDS_FAL_TEST}s'")
-    print(f"Semaphore limit for test: {PER_MIN_RATE_LIMIT_FAL_TEST}")
-
-    image_handler = None
+        print("ERROR: FAL_KEY not found or in incorrect format in .env file.", file=sys.stderr)
+        return
+    
+    print(f"Target Fal Model ID (appId): {FALAI_IMAGE_MODEL_ID}")
+    print(f"Configured Price/Sec (for fallback calculation): ${FAL_GPT_IMAGE_1_PRICE_PER_SECOND:.8f}")
+    
+    image_handler_rest = None
     try:
-        # Pass test-specific timeout to handler
-        image_handler = PromptToImageFal(api_retries=1, timeout=DEFAULT_TIMEOUT_SECONDS_FAL_TEST)
-
+        # Initialize with 0 submission retries for faster test feedback on critical errors.
+        image_handler_rest = PromptToImageFalRest(submit_retries=0, polling_timeout=DEFAULT_POLLING_TIMEOUT_SEC)
+        
         test_prompts = [
-            "Ultra-HD, photorealistic image: A cunning red fox, fur detailed to the whisker, stealthily navigates a dew-kissed forest floor at dawn. Soft golden light filters through the dense canopy, illuminating patches of moss and ferns. One paw is delicately lifted mid-stride. Its amber eyes are sharply focused on something unseen. gpt-image-1 style.",
-            "Whimsical digital painting: A tiny, glowing astronaut cat, wearing a comically oversized helmet, joyfully bounces on a giant, cratered cheese moon. Earth hangs like a distant blue marble in a swirling nebula of pink and purple. Stars twinkle brightly. gpt-image-1 style.",
-            "Extreme close-up, macro photography: A single, perfectly formed snowflake rests on a dark, textured piece of wool. The intricate, symmetrical patterns of the ice crystal are sharply defined. Tiny air bubbles are trapped within its structure. Refracted light creates rainbow micro-glints. gpt-image-1 style.",
-            "Surreal matte painting: A colossal, antique pocket watch, its gears exposed and rusted, melts dramatically over a vast, sun-scorched desert. The sky above is a maelstrom of dark, turbulent storm clouds, with a single ray of light piercing through to illuminate the watch. Time itself seems to be dissolving. gpt-image-1 style.",
-            "Concept art sketch, detailed: A friendly, bipedal robot companion, primarily white with orange accents, stands in a bright, modern workshop. It has large, expressive eyes and a slightly curious head tilt. Tools and holographic schematics are visible in the background. gpt-image-1 style.",
-            "Vibrant abstract digital art: Flowing ribbons of electric blue, fiery orange, and deep magenta intertwine and swirl across a dark canvas, representing the boundless energy of 'creativity'. Textured brushstrokes and particle effects add depth and dynamism. gpt-image_1 style.",
-            "Charming illustration: A fluffy corgi dog with a joyful expression zooms through a star-dusted galaxy, riding a giant slice of pepperoni pizza as if it were a surfboard. A colorful nebula forms a vibrant backdrop. Its tongue is lolling out in a happy pant. gpt-image-1 style."
+            "V4.0 Test: A photorealistic image of a majestic wolf howling at a luminous full moon in a snowy forest, gpt-image-1 style.",
+            "V4.0 Test: An oil painting of a quaint Parisian street cafe scene at dusk, with warm lights and cobblestone streets, gpt-image-1 style."
         ]
-        num_tasks = 7 # Test 7 images
+        num_tasks = len(test_prompts)
 
-        test_output_dir = Path("temp_files") / "image_test_fal_concurrent_v3" # New dir for new test
+        test_output_dir = Path("temp_files") / "image_test_fal_rest_v4_0_0"
         test_output_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Output images will be saved to: {test_output_dir}")
-
-        semaphore = asyncio.Semaphore(PER_MIN_RATE_LIMIT_FAL_TEST)
-        print(f"\nConcurrency limited to {PER_MIN_RATE_LIMIT_FAL_TEST} tasks using Semaphore.")
-
+        print(f"Output images will be saved to: {test_output_dir.resolve()}")
+        
+        semaphore = asyncio.Semaphore(2) # Limit concurrency for testing
         tasks = []
-        print(f"Creating {num_tasks} Fal image generation tasks...")
-        for i, prompt_text in enumerate(test_prompts[:num_tasks]): # Slice to ensure 7 tasks
-            filename = f"test_image_fal_v3_{i+1}.png"
-            output_path = test_output_dir / filename
+        print(f"\nCreating {num_tasks} Fal REST image generation task(s) with concurrency limit of {semaphore._value}...")
+        for i, prompt_text in enumerate(test_prompts):
+            output_path_obj = test_output_dir / f"test_image_v400_{i+1}.png"
             task = asyncio.create_task(
-                run_fal_image_gen_task(
-                    image_handler, prompt_text, output_path, task_id=i+1, semaphore=semaphore,
-                    size=DEFAULT_IMAGE_SIZE_FAL_TEST, # Use test parameters
-                    quality=DEFAULT_IMAGE_QUALITY_FAL_TEST,
-                    background=DEFAULT_IMAGE_BACKGROUND_FAL_TEST
-                ),
-                name=f"FalImageTask_v3_{i+1}"
+                run_fal_image_gen_task_rest(
+                    image_handler_rest, prompt_text, output_path_obj, 
+                    task_id = i+1, sem = semaphore,
+                    size_str = DEFAULT_IMAGE_SIZE_FAL_TEST, 
+                    quality_str = DEFAULT_IMAGE_QUALITY_FAL_TEST, 
+                    background_str = DEFAULT_IMAGE_BACKGROUND_FAL_TEST
+                ), 
+                name=f"FalRestImageTask_v400_{i+1}" # Name the asyncio task
             )
             tasks.append(task)
+            
+        batch_start_time = time.monotonic()
+        print(f"Waiting for {num_tasks} task(s) to complete...")
+        results_or_exceptions = await asyncio.gather(*tasks, return_exceptions=True)
+        batch_total_duration = time.monotonic() - batch_start_time
+        print(f"--- Batch processing finished in {batch_total_duration:.3f}s ---")
 
-        print(f"Waiting for {num_tasks} tasks to complete (max {PER_MIN_RATE_LIMIT_FAL_TEST} concurrent)...")
-        concurrent_start_time = time.monotonic()
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        total_concurrent_duration = time.monotonic() - concurrent_start_time
-        print(f"--- Fal Concurrent execution finished in {total_concurrent_duration:.3f}s ---")
+        print("\n--- Individual Task Results (V4.0.0) ---")
+        successful_task_count = 0
+        batch_total_cost_this_run = Decimal("0.0")
 
-        print("\n--- Individual Fal Task Results ---")
-        successful_tasks = 0; total_cost_all_tasks = Decimal("0.0"); failed_task_details = []
-        for i, res in enumerate(results):
-            print("-" * 20); task_name = tasks[i].get_name()
-            if isinstance(res, Exception):
-                logger.error(f"Task {task_name} failed catastrophically: {res}", exc_info=res)
-                print(f"Task {i+1} ({task_name}): CATASTROPHIC FAILURE\n  Error: {res}")
-                failed_task_details.append(f"Task {i+1} ({task_name}): Catastrophic - {res}")
-            elif isinstance(res, dict):
-                 print(f"Task {i+1} ({task_name}) - Prompt: \"{test_prompts[i][:30]}...\"")
-                 print(f"  Status:   {res['status']}")
-                 print(f"  API Wait: {res['request_time']:.3f}s") # This is handler.get() wait
-                 cost = Decimal(str(res.get('cost','0.0')))
-                 
-                 if res['status'] == "success":
-                     successful_tasks += 1; total_cost_all_tasks += cost 
-                     print(f"  Image:    {res.get('image_path')}")
-                     print(f"  Cost Est: ${cost:.6f} (Inference: {res.get('inference_time_sec',0.0):.3f}s)")
-                     if res.get('revised_prompt'): print(f"  Revised:  {res['revised_prompt']}")
-                 else:
-                    if res.get('cost') is not None: total_cost_all_tasks += cost
-                    print(f"  Cost Est: ${cost:.6f} (Attempted)")
-                    if res.get('inference_time_sec', 0.0) > 0: print(f"  Inference Attempt: {res['inference_time_sec']:.3f}s")
-                    print(f"  Error:    {res.get('error_message')}")
-                    failed_task_details.append(f"Task {i+1} ({task_name}): Status='{res['status']}' - {res.get('error_message')}")
-            else:
-                print(f"Task ID {i+1} ({task_name}): UNEXPECTED RESULT: {type(res)}")
-                failed_task_details.append(f"Task {i+1} ({task_name}): Unexpected type {type(res)}")
+        for i, res_or_exc in enumerate(results_or_exceptions):
+            task_name = tasks[i].get_name() if i < len(tasks) else f"Task {i+1}"
+            current_prompt = test_prompts[i] if i < len(test_prompts) else "N/A"
+            print(f"\n--- Result for {task_name} (Prompt: \"{current_prompt[:40]}...\") ---")
+            # For robust debugging, print the raw result or exception
+            # print(f"  DEBUG: Raw result/exception ({type(res_or_exc)}): {str(res_or_exc)[:300]}{'...' if len(str(res_or_exc)) > 300 else ''}")
 
-        print("\n" + "="*25 + " Fal Image Gen Test Summary (V2) " + "="*25)
-        print(f"Total Wall-Clock (Batch): {total_concurrent_duration:.3f}s")
-        print(f"Attempted / Successful: {len(tasks)} / {successful_tasks}")
-        if failed_task_details:
-             print("Failed Tasks:"); [print(f"  - {d}") for d in failed_task_details[:5]]; print("  ..." if len(failed_task_details)>5 else "")
-        print(f"Total Cost (Results/Attempts): ${total_cost_all_tasks:.6f}")
-        print("-" * 76)
-        if image_handler:
-            stats = image_handler.get_stats()
-            print(f"Handler Metrics: Req:{stats['total_requests']} (S:{stats['successful']},F:{stats['failed']}), Cost:${stats['total_estimated_cost']:.6f}, API Wait Sum:{stats['total_successful_request_duration_sum']:.3f}s, Fal Inf Sum:{stats['total_inference_time_sec_all_successful']:.3f}s")
-        print("=" * 76)
-
-    except Exception as e: logger.error(f"Unexpected test error: {e}", exc_info=True)
+            if res_or_exc is None: # Should ideally not happen with return_exceptions=True
+                print(f"  Status: CRITICAL_ERROR - Task returned None.")
+            elif isinstance(res_or_exc, Exception): 
+                print(f"  Status: FAILED_WITH_EXCEPTION")
+                print(f"  Error Type: {type(res_or_exc).__name__}")
+                print(f"  Error Details: {str(res_or_exc)}")
+            elif isinstance(res_or_exc, dict):
+                status = res_or_exc.get('status', 'Status N/A')
+                api_time = res_or_exc.get('api_call_duration_sec', 0.0)
+                print(f"  Status: {status.upper()}")
+                print(f"  Wall-Clock API Call Time: {api_time:.3f}s")
+                
+                cost_val = Decimal(str(res_or_exc.get('cost', '0.0')))
+                billing_time_val = res_or_exc.get('billing_duration_sec', 0.0)
+                print(f"  Reported Cost: ${cost_val:.6f}")
+                print(f"  Reported Billing Duration: {billing_time_val:.3f}s")
+                
+                if status == "success": 
+                    successful_task_count += 1
+                    batch_total_cost_this_run += cost_val
+                    print(f"  Image Path: {res_or_exc.get('image_path', 'N/A')}")
+                    if res_or_exc.get('revised_prompt'): 
+                        print(f"  Revised Prompt: {res_or_exc.get('revised_prompt')}")
+                else: 
+                    print(f"  Error Message: {res_or_exc.get('error_message', 'No specific error message.')}")
+                
+                print(f"  Fal Request ID: {res_or_exc.get('fal_request_id', 'N/A')}")
+                # print(f"  Raw Final Resp Snippet: {res_or_exc.get('raw_final_response_snippet', 'N/A')[:70]}...") # Optional detailed log
+            else: 
+                print(f"  Status: UNEXPECTED_RESULT_TYPE ({type(res_or_exc)})")
+        
+        print(f"\n--- Test Run Summary (V4.0.0) ---")
+        print(f"Total Wall-Clock Time for Batch: {batch_total_duration:.3f}s")
+        print(f"Tasks Attempted: {len(tasks)}, Successful: {successful_task_count}")
+        print(f"Total Cost for Successful Tasks in this Batch: ${batch_total_cost_this_run:.6f}")
+        
+        if image_handler_rest: 
+            stats = image_handler_rest.get_stats()
+            print("\n--- Handler Cumulative Statistics ---")
+            for key, value in stats.items():
+                if isinstance(value, Decimal): print(f"  {key.replace('_', ' ').title()}: ${value:.6f}")
+                elif isinstance(value, float): print(f"  {key.replace('_', ' ').title()}: {value:.3f}s")
+                else: print(f"  {key.replace('_', ' ').title()}: {value}")
+            
+    except Exception as e_main_test: # Catch errors from main_test_fal_rest setup or teardown
+        logger.error(f"Error in main_test_fal_rest: {e_main_test}", exc_info=True)
+        print(f"CRITICAL ERROR in test harness: {e_main_test}")
     finally:
-        if image_handler: await image_handler.close_session()
+        if image_handler_rest: 
+            await image_handler_rest.close_session()
 
 if __name__ == "__main__":
-    if sys.platform == "win32" and sys.version_info >= (3, 8):
+    # Standard asyncio setup for Windows compatibility
+    if sys.platform == "win32" and sys.version_info >= (3,8):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try:
-        asyncio.run(main_test_fal())
-    except KeyboardInterrupt: print("\nFal Test interrupted.")
+        asyncio.run(main_test_fal_rest())
+    except KeyboardInterrupt: 
+        print("\nTest run interrupted by user (KeyboardInterrupt).")
+    except Exception as e_asyncio_run: # Catch any other very top-level errors
+        print(f"Critical error during asyncio.run execution: {type(e_asyncio_run).__name__}: {e_asyncio_run}")
+        logger.error("Critical error during asyncio.run", exc_info=True)
+
